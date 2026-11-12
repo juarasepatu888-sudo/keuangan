@@ -722,19 +722,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
     if (!barcode || !barcode.trim() || barcode.trim().length < 2) return null;
     const clean = barcode.trim().toUpperCase();
 
-    // 1. Cek duplikat sesama item di formulir penjualan saat ini
-    const siblingIdx = saleItems.findIndex((it) => it.id !== currentItemId && it.barcode && it.barcode.trim().toUpperCase() === clean);
-    if (siblingIdx !== -1) {
-      const siblingNum = siblingIdx + 1;
-      const sib = saleItems[siblingIdx];
-      return {
-        type: 'sibling',
-        conflictBarcode: clean,
-        message: `Peringatan: Barcode "${clean}" sudah dimasukkan pada Sepatu #${siblingNum}${sib.name ? ` (${sib.name})` : ''} di daftar ini! Jangan memasukkan barcode ganda.`
-      };
-    }
-
-    // 2. Cek apakah barcode ini ada di stok barang yang tersedia
+    // 1. Cek apakah barcode ini ada di stok barang yang tersedia
     const stockReport = store.getRealtimeStockReport({ excludeTrxId: isEditMode ? editId : null });
     const allReportItems = stockReport.items || [];
     const stockItem = allReportItems.find((item) => {
@@ -753,15 +741,35 @@ export function initTambahTransaksiPage(router, store, params = {}) {
           message: `Barang dengan barcode "${clean}" tidak ditemukan di database stok.`
         };
       }
-    } else if (stockItem.sisaStock <= 0) {
-      const soldTrx = store.findSoldTransactionByBarcode(clean, isEditMode ? editId : null);
-      const buyerInfo = soldTrx && soldTrx.buyer ? `ke ${soldTrx.buyer}` : '';
-      const notaInfo = soldTrx && soldTrx.nota ? `pada ${soldTrx.nota}` : 'di transaksi sebelumnya';
-      return {
-        type: 'out_of_stock',
-        conflictBarcode: clean,
-        message: `❌ Sepatu dengan barcode "${clean}" SUDAH HABIS TERJUAL ${notaInfo} ${buyerInfo}! (Sisa stok: 0).`
-      };
+    } else {
+      if (stockItem.sisaStock <= 0) {
+        const soldTrx = store.findSoldTransactionByBarcode(clean, isEditMode ? editId : null);
+        const buyerInfo = soldTrx && soldTrx.buyer ? `ke ${soldTrx.buyer}` : '';
+        const notaInfo = soldTrx && soldTrx.nota ? `pada ${soldTrx.nota}` : 'di transaksi sebelumnya';
+        return {
+          type: 'out_of_stock',
+          conflictBarcode: clean,
+          message: `❌ Sepatu dengan barcode "${clean}" SUDAH HABIS TERJUAL ${notaInfo} ${buyerInfo}! (Sisa stok: 0).`
+        };
+      }
+
+      // Hitung akumulasi total pasang barcode ini di SELURUH baris form penjualan
+      syncSaleItemsFromDOM();
+      let totalQtyUsedInForm = 0;
+      saleItems.forEach((it) => {
+        if (it.barcode && it.barcode.trim().toUpperCase() === clean) {
+          const q = Math.max(1, Number(it.qty) || 1);
+          totalQtyUsedInForm += q;
+        }
+      });
+
+      if (totalQtyUsedInForm > stockItem.sisaStock) {
+        return {
+          type: 'exceed_stock',
+          conflictBarcode: clean,
+          message: `❌ Total pesanan barcode "${clean}" (${totalQtyUsedInForm} pasang) melebihi sisa stok yang ada (${stockItem.sisaStock} pasang)!`
+        };
+      }
     }
 
     return null;
@@ -865,17 +873,26 @@ export function initTambahTransaksiPage(router, store, params = {}) {
     const popup = cardEl.querySelector('.stock-dropdown-popup');
     if (!popup) return;
 
-    // Filter keluar barcode yang sedang dipilih pada sepatu lain di form ini
-    const otherSelectedBarcodes = new Set(
-      saleItems
-        .filter((it) => it.id !== itemId && it.barcode)
-        .map((it) => it.barcode.trim().toUpperCase())
-    );
-
-    // Ambil daftar sepatu yang tersedia di stok & belum terjual
-    const available = store.getAvailableProducts(isEditMode ? editId : null).filter((p) => {
-      return !otherSelectedBarcodes.has(p.barcode.toString().trim().toUpperCase());
+    // Hitung berapa pasang barcode ini yang sudah terpakai di baris kartu LAIN
+    syncSaleItemsFromDOM();
+    const usedQtyByBarcode = new Map();
+    saleItems.forEach((it) => {
+      if (it.id !== itemId && it.barcode) {
+        const bc = it.barcode.trim().toUpperCase();
+        const q = Math.max(1, Number(it.qty) || 1);
+        usedQtyByBarcode.set(bc, (usedQtyByBarcode.get(bc) || 0) + q);
+      }
     });
+
+    // Ambil daftar sepatu yang sisa stoknya masih tersedia (sisaStock - yang sudah terpakai di baris lain > 0)
+    const available = store.getAvailableProducts(isEditMode ? editId : null)
+      .map((p) => {
+        const bc = p.barcode ? p.barcode.toString().trim().toUpperCase() : '';
+        const usedOther = usedQtyByBarcode.get(bc) || 0;
+        const sisaTersedia = (p.sisaStock || 0) - usedOther;
+        return { ...p, sisaTersedia };
+      })
+      .filter((p) => p.sisaTersedia > 0);
 
     const query = (searchQuery || '').trim().toLowerCase();
     const filtered = query
@@ -908,7 +925,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
       <div class="px-2.5 py-1.5 flex items-center justify-between border-b border-white/45 text-[11px] font-bold text-primary glass-panel bg-white/40 rounded-xl mb-1">
         <span class="flex items-center gap-1">
           <span class="material-symbols-outlined text-[15px]">inventory_2</span>
-          <span>Stok Tersedia (${filtered.length} Sepatu)</span>
+          <span>Stok Tersedia (${filtered.length} Model)</span>
         </span>
         <div class="flex items-center gap-1.5">
           <span class="text-[10px] text-on-surface-variant font-normal">Pilih untuk auto-fill</span>
@@ -936,6 +953,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
               <span class="font-bold text-xs text-on-surface truncate">${p.name || 'Sepatu Tanpa Nama'}</span>
               <div class="flex items-center gap-1.5 text-[10px] text-on-surface-variant mt-0.5">
                 <span class="font-mono font-bold glass-chip px-1.5 py-0.2 rounded text-primary">${p.barcode}</span>
+                <span class="text-[9px] text-primary font-semibold bg-primary/10 px-1 rounded">Sisa: ${p.sisaTersedia} psg</span>
                 ${p.kondisi === 'Minus' ? '<span class="text-amber-700 font-bold bg-amber-50 px-1 rounded border border-amber-200">⚠ Minus</span>' : '<span class="text-emerald-700 font-bold bg-emerald-50 px-1 rounded border border-emerald-200">✓ Bagus</span>'}
               </div>
             </div>
@@ -1146,6 +1164,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
     });
     document.querySelectorAll('.btn-remove-sale-item').forEach((btn) => {
       btn.addEventListener('click', () => {
+        syncSaleItemsFromDOM();
         const itemId = btn.getAttribute('data-sale-item-id');
         saleItems = saleItems.filter((it) => it.id !== itemId);
         rerenderItemsContainer();
@@ -1174,6 +1193,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
   const btnAddItem = document.getElementById('btn-add-sale-item');
   if (btnAddItem) {
     btnAddItem.addEventListener('click', () => {
+      syncSaleItemsFromDOM();
       saleItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null });
       rerenderItemsContainer();
       showToast('Sepatu baru ditambahkan!', 'success');
@@ -1486,6 +1506,23 @@ export function initTambahTransaksiPage(router, store, params = {}) {
           // PENTING: Jangan bunyikan beep success dan jangan loop berulang!
           showToast('❌ Barang sudah laku atau tidak ada di stok', 'error', 3000);
           setScannerStatus('Barang tidak ditemukan di stok', 'error');
+          showRetryButton(true);
+          return;
+        }
+
+        // Cek apakah kuantitas barcode ini di baris lain sudah menghabiskan sisa stok
+        syncSaleItemsFromDOM();
+        let usedOther = 0;
+        saleItems.forEach((it) => {
+          if (it.id !== activeScanItemId && it.barcode && it.barcode.trim().toUpperCase() === cleanBarcode.toUpperCase()) {
+            usedOther += Math.max(1, Number(it.qty) || 1);
+          }
+        });
+
+        const sisaTersedia = (matchedItem.sisaStock || 0) - usedOther;
+        if (sisaTersedia <= 0) {
+          showToast(`❌ Sisa stok barcode "${cleanBarcode}" sudah dialokasikan (${matchedItem.sisaStock} pasang)`, 'error', 3500);
+          setScannerStatus(`Stok barcode "${cleanBarcode}" sudah habis dialokasikan`, 'error');
           showRetryButton(true);
           return;
         }

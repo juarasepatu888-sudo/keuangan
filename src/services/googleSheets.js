@@ -1330,7 +1330,7 @@ export async function syncAllToGoogleSheets(store, explicitSpreadsheetId = null)
         if (!isInvestor) {
           dailyStatsMap[d].masukPenjualan += amt;
           if (t.items && Array.isArray(t.items) && t.items.length > 0) {
-            dailyStatsMap[d].pasang += t.items.length;
+            dailyStatsMap[d].pasang += t.items.reduce((s, it) => s + (Number(it.qty) || 1), 0);
           } else {
             dailyStatsMap[d].pasang += Number(t.itemCount) || 1;
           }
@@ -1427,7 +1427,7 @@ export async function syncAllToGoogleSheets(store, explicitSpreadsheetId = null)
       countTrxSepatu += 1;
 
       if (t.items && Array.isArray(t.items) && t.items.length > 0) {
-        totalPasangLaku += t.items.length;
+        totalPasangLaku += t.items.reduce((s, it) => s + (Number(it.qty) || 1), 0);
       } else {
         totalPasangLaku += Number(t.itemCount) || 1;
       }
