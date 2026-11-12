@@ -201,30 +201,39 @@ function renderItemCardHtml(item, index, totalItems) {
         </div>
       </div>
 
-      <!-- 5. Qty (Stepper) & Harga Beli -->
-      <div class="grid grid-cols-2 gap-2.5">
-        <div class="flex flex-col gap-1 glass-panel p-2.5 rounded-xl">
-          <span class="font-label-sm text-[11px] text-on-surface font-semibold">Jumlah Pasang (Qty)</span>
-          <div class="flex items-center justify-between gap-1 mt-1">
-            <button type="button" class="btn-qty-minus w-8 h-8 rounded-lg glass-chip-btn text-on-surface font-bold text-lg flex items-center justify-center active:scale-95 select-none" data-item-id="${item.id}">−</button>
+      <!-- 5. Qty (Stepper) & Harga Beli (2 Card Berdampingan Simetris) -->
+      <div class="grid grid-cols-2 gap-2.5 items-stretch">
+        <!-- Card 1: Qty -->
+        <div class="flex flex-col justify-between glass-panel p-2.5 rounded-xl border border-white/10">
+          <label class="font-label-sm text-[11px] text-on-surface font-semibold flex items-center gap-1">
+            <span class="material-symbols-outlined text-[13px] text-primary">tag</span>
+            <span>Jumlah Pasang</span>
+          </label>
+          <div class="flex items-center justify-between gap-1 mt-2 bg-black/25 p-1 rounded-lg border border-white/5 h-9">
+            <button type="button" class="btn-qty-minus w-7 h-7 rounded-md glass-chip-btn text-on-surface font-bold text-base flex items-center justify-center active:scale-90 transition-all select-none" data-item-id="${item.id}" title="Kurangi 1">−</button>
             <input type="number" min="1" max="999"
-              class="input-qty w-12 text-center rounded-lg glass-input text-on-surface font-bold text-sm font-tabular focus:outline-none focus:ring-2 focus:ring-on-tertiary-container py-1"
+              class="input-qty w-10 text-center bg-transparent text-on-surface font-bold text-sm font-tabular focus:outline-none"
               value="${item.qty || 1}"
               data-item-id="${item.id}"
             />
-            <button type="button" class="btn-qty-plus w-8 h-8 rounded-lg glass-primary glass-btn text-primary-btn font-bold text-lg flex items-center justify-center active:scale-95 select-none" data-item-id="${item.id}">+</button>
+            <button type="button" class="btn-qty-plus w-7 h-7 rounded-md glass-primary glass-btn text-primary-btn font-bold text-base flex items-center justify-center active:scale-90 transition-all select-none shadow-sm" data-item-id="${item.id}" title="Tambah 1">+</button>
           </div>
         </div>
 
-        <div class="flex flex-col gap-1">
-          <label class="font-label-sm text-[11px] text-on-surface-variant font-semibold">Harga Beli / Pasang</label>
-          <div class="relative">
-            <span class="absolute left-2.5 top-2.5 text-xs text-on-surface-variant font-bold">Rp</span>
+        <!-- Card 2: Harga Beli -->
+        <div class="flex flex-col justify-between glass-panel p-2.5 rounded-xl border border-white/10">
+          <label class="font-label-sm text-[11px] text-on-surface font-semibold flex items-center gap-1">
+            <span class="material-symbols-outlined text-[13px] text-primary">payments</span>
+            <span>Harga Beli / Psg</span>
+          </label>
+          <div class="relative mt-2 flex items-center bg-black/25 px-2.5 rounded-lg border border-white/5 h-9 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/40 transition-all">
+            <span class="text-xs text-on-surface-variant font-bold select-none mr-1">Rp</span>
             <input 
               type="text" 
- class="input-harga-beli w-full pl-7 pr-2.5 py-2 rounded-xl glass-input text-on-surface font-bold text-sm font-tabular focus:outline-none focus:ring-2 focus:ring-on-tertiary-container"
+              class="input-harga-beli w-full bg-transparent text-on-surface font-bold text-sm font-tabular focus:outline-none"
               value="${priceVal}"
               data-item-id="${item.id}"
+              placeholder="0"
             />
           </div>
         </div>
