@@ -30,8 +30,6 @@ function genItemId() { return 'sale-item-' + Date.now() + '-' + Math.floor(Math.
 function renderSaleItemCard(item, index, totalItems) {
   const num = index + 1;
   const priceVal = item.price ? formatRupiah(item.price, '') : '';
-  const itemQty = Math.max(1, Number(item.qty) || 1);
-  const subtotalVal = formatRupiah((Number(item.price) || 0) * itemQty, '');
 
   return `
  <div class="sale-item-card glass-card glass-sheen rounded-xl p-2.5 flex flex-col gap-2" data-sale-item-id="${item.id}">
@@ -94,51 +92,20 @@ function renderSaleItemCard(item, index, totalItems) {
         <div class="sale-item-warning-text leading-snug flex-1"></div>
       </div>
 
-      <!-- Qty Stepper & Harga Jual Satuan (2 Card Berdampingan Simetris) -->
-      <div class="grid grid-cols-2 gap-2 items-stretch mt-0.5">
-        <!-- Kolom Qty -->
-        <div class="flex flex-col justify-between glass-panel p-2 rounded-xl border border-white/10">
-          <label class="font-label-sm text-[10px] text-on-surface font-semibold flex items-center gap-1">
-            <span class="material-symbols-outlined text-[12px] text-primary">tag</span>
-            <span>Jumlah (Qty)</span>
-          </label>
-          <div class="flex items-center justify-between gap-1 mt-1.5 bg-black/25 p-1 rounded-lg border border-white/5 h-8">
-            <button type="button" class="btn-sale-qty-minus w-6 h-6 rounded-md glass-chip-btn text-on-surface font-bold text-sm flex items-center justify-center active:scale-90 transition-all select-none" data-sale-item-id="${item.id}" title="Kurangi 1">−</button>
-            <input type="number" min="1" max="999"
-              class="sale-item-qty w-10 text-center bg-transparent text-on-surface font-bold text-xs font-tabular focus:outline-none"
-              value="${itemQty}"
-              data-sale-item-id="${item.id}"
-            />
-            <button type="button" class="btn-sale-qty-plus w-6 h-6 rounded-md glass-primary glass-btn text-primary-btn font-bold text-sm flex items-center justify-center active:scale-90 transition-all select-none shadow-sm" data-sale-item-id="${item.id}" title="Tambah 1">+</button>
-          </div>
+      <!-- Input Harga Jual Sepatu Ini (Harga Variatif per Item) -->
+      <div class="flex items-center gap-2 mt-0.5">
+        <div class="relative flex-1">
+          <span class="absolute left-2.5 top-2 text-[11px] text-on-surface-variant font-bold select-none">Rp</span>
+          <input 
+            type="text" 
+            class="sale-item-price w-full pl-8 pr-2.5 py-1.5 rounded-lg glass-input text-on-surface font-bold text-xs font-tabular focus:outline-none focus:ring-2 focus:ring-on-tertiary-container" 
+            placeholder="0" 
+            value="${priceVal}" 
+            inputmode="numeric" 
+            data-sale-item-id="${item.id}" 
+          />
         </div>
-
-        <!-- Kolom Harga Jual -->
-        <div class="flex flex-col justify-between glass-panel p-2 rounded-xl border border-white/10">
-          <label class="font-label-sm text-[10px] text-on-surface font-semibold flex items-center gap-1">
-            <span class="material-symbols-outlined text-[12px] text-primary">sell</span>
-            <span>Harga Satuan</span>
-          </label>
-          <div class="relative mt-1.5 flex items-center bg-black/25 px-2 rounded-lg border border-white/5 h-8 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/40 transition-all">
-            <span class="text-[10px] text-on-surface-variant font-bold select-none mr-1">Rp</span>
-            <input 
-              type="text" 
-              class="sale-item-price w-full bg-transparent text-on-surface font-bold text-xs font-tabular focus:outline-none" 
-              placeholder="0" 
-              value="${priceVal}" 
-              inputmode="numeric" 
-              data-sale-item-id="${item.id}" 
-            />
-          </div>
-        </div>
-      </div>
-
-      <!-- Subtotal Item -->
-      <div class="sale-item-subtotal-row flex items-center justify-between text-[11px] px-2 py-1 rounded-lg bg-black/20 border border-white/5" data-sale-item-id="${item.id}">
-        <span class="text-[10px] text-on-surface-variant">Subtotal (<span class="sale-item-subtotal-qty font-bold text-on-surface">${itemQty}</span> pasang):</span>
-        <span class="sale-item-subtotal-val font-bold font-tabular text-primary text-xs">
-          Rp ${subtotalVal}
-        </span>
+        <span class="text-[11px] text-on-surface-variant font-semibold shrink-0">Harga Jual</span>
       </div>
     </div>
   `;
@@ -157,11 +124,10 @@ export function renderTambahTransaksiPage(store, params = {}) {
       name: it.name || '', 
       kondisi: it.kondisi || 'Bagus', 
       price: it.price || 0, 
-      qty: Number(it.qty) || 1,
       photo: it.photo || null 
     }));
     if (params && params.autoAddNewItem) {
-      initialItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null });
+      initialItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null });
     }
   } else if (isEdit && existingTrx) {
     initialItems = [{ 
@@ -170,14 +136,13 @@ export function renderTambahTransaksiPage(store, params = {}) {
       name: existingTrx.productName || '', 
       kondisi: existingTrx.kondisi || 'Bagus', 
       price: existingTrx.amount || 0, 
-      qty: Number(existingTrx.itemCount) || 1,
       photo: existingTrx.photo || null 
     }];
     if (params && params.autoAddNewItem) {
-      initialItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null });
+      initialItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null });
     }
   } else {
-    initialItems = [{ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null }];
+    initialItems = [{ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null }];
   }
 
   const defaultBuyer = existingTrx ? (existingTrx.buyer || '') : '';
@@ -191,8 +156,7 @@ export function renderTambahTransaksiPage(store, params = {}) {
   const defaultNota = existingTrx ? (existingTrx.nota || '') : '';
   const supplies = store.getSupplies ? store.getSupplies() : [];
   const belanjaFakturList = store.getBelanjaSepatuFakturList ? store.getBelanjaSepatuFakturList() : [];
-  const totalInitialQty = initialItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
-  const totalItemsPrice = initialItems.reduce((s, it) => s + ((Number(it.price) || 0) * (Number(it.qty) || 1)), 0);
+  const totalItemsPrice = initialItems.reduce((s, it) => s + (Number(it.price) || 0), 0);
 
   return `
     <div class="page-fade-in flex-1 flex flex-col w-full bg-surface pb-16">
@@ -241,30 +205,37 @@ export function renderTambahTransaksiPage(store, params = {}) {
           </div>
 
           <!-- MULTI-ITEM CART -->
- <div class="glass-card glass-sheen rounded-xl p-3 flex flex-col gap-2">
-            <div class="flex items-center justify-between">
+          <div class="glass-card glass-sheen rounded-xl p-3 flex flex-col gap-2.5">
+            <div class="flex items-center justify-between border-b border-white/20 pb-2">
               <div class="flex items-center gap-1.5">
                 <span class="material-symbols-outlined text-primary text-[20px]">shopping_cart</span>
                 <span class="font-label-md text-xs text-primary font-bold uppercase tracking-wider">Daftar Sepatu Terjual</span>
               </div>
-              <span id="sale-item-count-badge" class="font-label-sm text-[10px] bg-primary/10 text-primary border border-primary/20 px-2 py-0.5 rounded-full font-bold">${totalInitialQty} pasang</span>
+              <!-- Stepper Jumlah Sepatu Dibeli (Untuk Pembelian > 1 Pcs) -->
+              <div class="flex items-center gap-1.5 bg-black/30 px-2 py-1 rounded-xl border border-white/10">
+                <span class="text-[10px] text-on-surface-variant font-semibold">Qty Beli:</span>
+                <button type="button" id="btn-decrease-cart-qty" class="w-6 h-6 rounded-md glass-chip-btn text-on-surface font-bold text-xs flex items-center justify-center active:scale-90 select-none" title="Kurangi 1 sepatu">−</button>
+                <span id="sale-item-count-badge" class="font-label-sm text-xs text-primary font-tabular font-bold px-1">${initialItems.length} Psg</span>
+                <button type="button" id="btn-increase-cart-qty" class="w-6 h-6 rounded-md glass-primary glass-btn text-primary-btn font-bold text-xs flex items-center justify-center active:scale-90 select-none shadow-sm" title="Tambah 1 sepatu">+</button>
+              </div>
             </div>
+
             <div id="sale-items-container" class="flex flex-col gap-3">
               ${initialItems.map((item, idx) => renderSaleItemCard(item, idx, initialItems.length)).join('')}
             </div>
 
-            <!-- Tombol Tambah Sepatu Lagi: Di bawah setelah transaksi pertama selesai -->
-            <button type="button" id="btn-add-sale-item" class="${(initialItems[0] && (initialItems[0].price > 0 || initialItems[0].name)) ? 'flex' : 'hidden'} w-full py-3 rounded-xl border-2 border-dashed border-primary/40 hover:border-primary/70 bg-primary/5 hover:bg-primary/10 text-primary font-label-md text-xs font-bold items-center justify-center gap-2 active:scale-[0.99] transition-all">
-              <span class="material-symbols-outlined text-[18px]">add_circle</span>
-              <span>+ Tambah Sepatu Lain</span>
+            <!-- Tombol Tambah Sepatu Lain: Selalu tampil dan responsif -->
+            <button type="button" id="btn-add-sale-item" class="w-full py-2.5 rounded-xl border border-dashed border-primary/40 hover:border-primary/70 bg-primary/5 hover:bg-primary/10 text-primary font-label-md text-xs font-bold flex items-center justify-center gap-1.5 active:scale-[0.99] transition-all">
+              <span class="material-symbols-outlined text-[16px]">add_circle</span>
+              <span>+ Tambah Sepatu Lain (Harga Beda / Variatif)</span>
             </button>
 
             <!-- Total Penjualan Kas Masuk -->
-            <div class="flex items-center justify-between p-2.5 rounded-xl bg-black/25 border border-white/10 mt-1">
+            <div class="flex items-center justify-between p-2.5 rounded-xl bg-black/25 border border-white/10 mt-0.5">
               <div class="flex items-center gap-1.5 text-xs text-on-surface">
                 <span class="material-symbols-outlined text-primary text-[18px]">payments</span>
                 <span class="font-bold">Total Kas Masuk:</span>
-                <span id="sale-total-count" class="text-[11px] text-on-surface-variant font-medium">(${totalInitialQty} pasang)</span>
+                <span id="sale-total-count" class="text-[11px] text-on-surface-variant font-medium">(${initialItems.length} pasang)</span>
               </div>
               <span id="sale-total-amount" class="font-tabular font-bold text-sm text-primary">+Rp ${formatRupiah(totalItemsPrice, '')}</span>
             </div>
@@ -549,7 +520,6 @@ export function initTambahTransaksiPage(router, store, params = {}) {
       const id = card.getAttribute('data-sale-item-id');
       const bcInput = card.querySelector('.sale-item-barcode');
       const priceInput = card.querySelector('.sale-item-price');
-      const qtyInput = card.querySelector('.sale-item-qty');
       const nameLabel = card.querySelector('.sale-item-name-label');
       return {
         id: id,
@@ -557,7 +527,6 @@ export function initTambahTransaksiPage(router, store, params = {}) {
         name: (nameLabel ? nameLabel.textContent.trim() : ''),
         kondisi: 'Bagus',
         price: parseRupiah(priceInput ? priceInput.value : '0'),
-        qty: Math.max(1, parseInt(qtyInput ? qtyInput.value : '1', 10) || 1),
         photo: null
       };
     });
@@ -568,7 +537,6 @@ export function initTambahTransaksiPage(router, store, params = {}) {
       name: it.name || '', 
       kondisi: it.kondisi || 'Bagus', 
       price: it.price || 0, 
-      qty: Number(it.qty) || 1, 
       photo: it.photo || null 
     }));
   } else if (isEditMode && existingTrx) {
@@ -578,11 +546,10 @@ export function initTambahTransaksiPage(router, store, params = {}) {
       name: existingTrx.productName || '', 
       kondisi: existingTrx.kondisi || 'Bagus', 
       price: existingTrx.amount || 0, 
-      qty: Number(existingTrx.itemCount) || 1, 
       photo: existingTrx.photo || null 
     }];
   } else {
-    saleItems = [{ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null }];
+    saleItems = [{ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null }];
   }
 
   const btnMasuk = document.getElementById('btn-switch-masuk');
@@ -641,12 +608,10 @@ export function initTambahTransaksiPage(router, store, params = {}) {
       const id = card.getAttribute('data-sale-item-id');
       const bcInput = card.querySelector('.sale-item-barcode');
       const priceInput = card.querySelector('.sale-item-price');
-      const qtyInput = card.querySelector('.sale-item-qty');
       const nameLabel = card.querySelector('.sale-item-name-label');
 
       const barcode = bcInput ? bcInput.value.trim() : '';
       const price = parseRupiah(priceInput ? priceInput.value : '0');
-      const qty = Math.max(1, parseInt(qtyInput ? qtyInput.value : '1', 10) || 1);
       const name = nameLabel ? nameLabel.textContent.trim() : '';
 
       let item = saleItems.find((it) => it.id === id);
@@ -655,14 +620,13 @@ export function initTambahTransaksiPage(router, store, params = {}) {
           saleItems[idx].id = id;
           item = saleItems[idx];
         } else {
-          item = { id, barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null };
+          item = { id, barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null };
           saleItems.push(item);
         }
       }
       if (item) {
         item.barcode = barcode;
         item.price = price;
-        item.qty = qty;
         if (name) item.name = name;
         else if (barcode && !item.name) {
           const prod = store.getProductByBarcode(barcode);
@@ -674,39 +638,20 @@ export function initTambahTransaksiPage(router, store, params = {}) {
 
   function recalcTotal() {
     syncSaleItemsFromDOM();
-    const total = saleItems.reduce((s, it) => s + ((Number(it.price) || 0) * (Number(it.qty) || 1)), 0);
-    const totalQty = saleItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
+    const total = saleItems.reduce((s, it) => s + (Number(it.price) || 0), 0);
+    const totalCount = saleItems.length;
     const totalEl = document.getElementById('sale-total-amount');
     const countEl = document.getElementById('sale-total-count');
     const badgeEl = document.getElementById('sale-item-count-badge');
     if (totalEl) totalEl.textContent = total > 0 ? ('+Rp ' + formatRupiah(total, '')) : 'Rp 0';
-    if (countEl) countEl.textContent = '(' + totalQty + ' pasang)';
-    if (badgeEl) badgeEl.textContent = totalQty + ' pasang';
+    if (countEl) countEl.textContent = '(' + totalCount + ' pasang)';
+    if (badgeEl) badgeEl.textContent = totalCount + ' Psg';
 
-    // Update subtotal untuk tiap kartu
-    saleItems.forEach((it) => {
-      const card = document.querySelector(`.sale-item-card[data-sale-item-id="${it.id}"]`);
-      if (card) {
-        const subtotalQtyEl = card.querySelector('.sale-item-subtotal-qty');
-        const subtotalValEl = card.querySelector('.sale-item-subtotal-val');
-        const q = Number(it.qty) || 1;
-        if (subtotalQtyEl) subtotalQtyEl.textContent = q;
-        if (subtotalValEl) subtotalValEl.textContent = 'Rp ' + formatRupiah((Number(it.price) || 0) * q, '');
-      }
-    });
-
-    // Tombol + Tambah Sepatu Lagi hanya muncul di bawah setelah transaksi pertama selesai
+    // Tombol + Tambah Sepatu Lain selalu aktif dan responsif
     const addMoreBtn = document.getElementById('btn-add-sale-item');
     if (addMoreBtn) {
-      const firstItem = saleItems[0];
-      const isFirstItemDone = Boolean(firstItem && (Number(firstItem.price) > 0 || (firstItem.name && firstItem.name.trim().length > 0) || (firstItem.barcode && firstItem.barcode.trim().length > 0)));
-      if (isFirstItemDone) {
-        addMoreBtn.classList.remove('hidden');
-        addMoreBtn.classList.add('flex');
-      } else {
-        addMoreBtn.classList.add('hidden');
-        addMoreBtn.classList.remove('flex');
-      }
+      addMoreBtn.classList.remove('hidden');
+      addMoreBtn.classList.add('flex');
     }
   }
 
@@ -1073,74 +1018,6 @@ export function initTambahTransaksiPage(router, store, params = {}) {
       });
     });
 
-    // Stepper Qty Beli (- / +) & Direct Input
-    document.querySelectorAll('.btn-sale-qty-minus').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const itemId = btn.getAttribute('data-sale-item-id');
-        let item = saleItems.find((it) => it.id === itemId);
-        if (!item && saleItems.length === 1) {
-          saleItems[0].id = itemId;
-          item = saleItems[0];
-        }
-        if (!item) {
-          syncSaleItemsFromDOM();
-          item = saleItems.find((it) => it.id === itemId);
-        }
-        if (item) {
-          item.qty = Math.max(1, (Number(item.qty) || 1) - 1);
-          const inputQty = document.querySelector(`.sale-item-qty[data-sale-item-id="${itemId}"]`);
-          if (inputQty) inputQty.value = item.qty;
-          recalcTotal();
-        }
-      });
-    });
-
-    document.querySelectorAll('.btn-sale-qty-plus').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const itemId = btn.getAttribute('data-sale-item-id');
-        let item = saleItems.find((it) => it.id === itemId);
-        if (!item && saleItems.length === 1) {
-          saleItems[0].id = itemId;
-          item = saleItems[0];
-        }
-        if (!item) {
-          syncSaleItemsFromDOM();
-          item = saleItems.find((it) => it.id === itemId);
-        }
-        if (item) {
-          item.qty = Math.min(999, (Number(item.qty) || 1) + 1);
-          const inputQty = document.querySelector(`.sale-item-qty[data-sale-item-id="${itemId}"]`);
-          if (inputQty) inputQty.value = item.qty;
-          recalcTotal();
-        }
-      });
-    });
-
-    document.querySelectorAll('.sale-item-qty').forEach((input) => {
-      input.addEventListener('input', (e) => {
-        const itemId = input.getAttribute('data-sale-item-id');
-        let item = saleItems.find((it) => it.id === itemId);
-        if (!item && saleItems.length === 1) {
-          saleItems[0].id = itemId;
-          item = saleItems[0];
-        }
-        if (!item) {
-          syncSaleItemsFromDOM();
-          item = saleItems.find((it) => it.id === itemId);
-        }
-        const val = parseInt(e.target.value, 10);
-        if (item) {
-          item.qty = isNaN(val) || val < 1 ? 1 : Math.min(999, val);
-          recalcTotal();
-        }
-      });
-      input.addEventListener('blur', (e) => {
-        const itemId = input.getAttribute('data-sale-item-id');
-        const item = saleItems.find((it) => it.id === itemId);
-        input.value = item ? (item.qty || 1) : 1;
-      });
-    });
-
     document.querySelectorAll('.btn-sale-item-camera').forEach((btn) => {
       btn.addEventListener('click', () => { activeScanItemId = btn.getAttribute('data-sale-item-id'); openScanner(); });
     });
@@ -1156,6 +1033,38 @@ export function initTambahTransaksiPage(router, store, params = {}) {
 
   bindItemCardEvents();
   recalcTotal();
+
+  // Stepper Qty Beli di Header Daftar Sepatu Terjual
+  const btnIncCart = document.getElementById('btn-increase-cart-qty');
+  const btnDecCart = document.getElementById('btn-decrease-cart-qty');
+
+  if (btnIncCart) {
+    btnIncCart.addEventListener('click', () => {
+      syncSaleItemsFromDOM();
+      saleItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null });
+      rerenderItemsContainer();
+      showToast(`Sepatu #${saleItems.length} ditambahkan!`, 'success');
+      setTimeout(() => {
+        const container = document.getElementById('sale-items-container');
+        if (container && container.lastElementChild) {
+          container.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 100);
+    });
+  }
+
+  if (btnDecCart) {
+    btnDecCart.addEventListener('click', () => {
+      syncSaleItemsFromDOM();
+      if (saleItems.length <= 1) {
+        showToast('Minimal 1 sepatu di transaksi', 'warning');
+        return;
+      }
+      saleItems.pop();
+      rerenderItemsContainer();
+      showToast(`Jumlah beli disesuaikan: ${saleItems.length} pasang`, 'info');
+    });
+  }
 
   if (params && params.autoAddNewItem) {
     setTimeout(() => {
@@ -1174,9 +1083,10 @@ export function initTambahTransaksiPage(router, store, params = {}) {
   const btnAddItem = document.getElementById('btn-add-sale-item');
   if (btnAddItem) {
     btnAddItem.addEventListener('click', () => {
-      saleItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, qty: 1, photo: null });
+      syncSaleItemsFromDOM();
+      saleItems.push({ id: genItemId(), barcode: '', name: '', kondisi: 'Bagus', price: 0, photo: null });
       rerenderItemsContainer();
-      showToast('Sepatu baru ditambahkan!', 'success');
+      showToast(`Sepatu #${saleItems.length} ditambahkan!`, 'success');
       setTimeout(() => {
         const container = document.getElementById('sale-items-container');
         if (container && container.lastElementChild) container.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1668,15 +1578,15 @@ export function initTambahTransaksiPage(router, store, params = {}) {
         const noteVal = (document.getElementById('input-notes') && document.getElementById('input-notes').value.trim()) || '';
         const ongkirRadio = document.querySelector('input[name="ongkirOption"]:checked');
         const ongkirVal = ongkirRadio ? ongkirRadio.value : 'FO';
-        const totalAmount = validItems.reduce((s, it) => s + ((Number(it.price) || 0) * (Number(it.qty) || 1)), 0);
-        const totalQty = validItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
+        const totalAmount = validItems.reduce((s, it) => s + (Number(it.price) || 0), 0);
+        const totalCount = validItems.length;
         const itemNames = validItems.filter((it) => it.name).map((it) => it.name);
         let title = '';
         if (buyerName && itemNames.length > 0) title = buyerName + ' \u2022 ' + itemNames.join(', ');
         else if (buyerName) title = 'Penjualan ke ' + buyerName;
         else if (itemNames.length > 0) title = itemNames.join(', ');
         else if (noteVal) title = noteVal;
-        else title = 'Penjualan ' + totalQty + ' Pasang Sepatu';
+        else title = 'Penjualan ' + totalCount + ' Pasang Sepatu';
         const primaryBarcode = (validItems.find((it) => it.barcode) || {}).barcode || null;
         const primaryProduct = validItems.find((it) => it.name);
         const trxData = {
@@ -1697,17 +1607,17 @@ export function initTambahTransaksiPage(router, store, params = {}) {
             name: it.name || null,
             kondisi: it.kondisi || 'Bagus',
             price: Number(it.price) || 0,
-            qty: Number(it.qty) || 1,
+            qty: 1,
             photo: it.photo || null
           })),
-          itemCount: totalQty
+          itemCount: totalCount
         };
         if (isEditMode) {
           store.updateTransaction(editId, trxData);
           showToast('Perubahan penjualan berhasil disimpan!', 'success');
         } else {
           store.addTransaction(trxData);
-          showToast('Penjualan ' + totalQty + ' pasang disimpan!', 'success');
+          showToast('Penjualan ' + totalCount + ' pasang disimpan!', 'success');
         }
       } else {
         const amount = parseRupiah(inputNominal ? inputNominal.value : '0');
