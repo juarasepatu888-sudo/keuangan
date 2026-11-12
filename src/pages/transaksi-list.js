@@ -1370,21 +1370,8 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
     const popup = document.getElementById('modal-stock-dropdown-popup');
     if (!popup) return;
 
-    // Filter keluar sepatu yang sudah terjual atau yang sudah ada di transaksi target
-    const currentTrx = store.getTransactionById(addItemTargetTrxId);
-    const existingBarcodes = new Set();
-    if (currentTrx) {
-      if (currentTrx.barcode) existingBarcodes.add(currentTrx.barcode.trim().toUpperCase());
-      if (currentTrx.items) {
-        currentTrx.items.forEach((it) => {
-          if (it.barcode) existingBarcodes.add(it.barcode.trim().toUpperCase());
-        });
-      }
-    }
-
-    const available = store.getAvailableProducts(addItemTargetTrxId).filter((p) => {
-      return !existingBarcodes.has(p.barcode.toString().trim().toUpperCase());
-    });
+    // Ambil daftar sepatu yang sisa stok fisiknya masih tersedia (> 0)
+    const available = store.getAvailableProducts();
 
     const query = (searchQuery || '').trim().toLowerCase();
     const filtered = query
@@ -1407,7 +1394,7 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
       <div class="px-2.5 py-1.5 flex items-center justify-between border-b border-white/45 text-[10px] font-bold text-primary glass-panel bg-white/40 rounded-t-xl">
         <span class="flex items-center gap-1">
           <span class="material-symbols-outlined text-[13px]">inventory_2</span>
-          <span>Stok Tersedia (${filtered.length} Sepatu)</span>
+          <span>Stok Tersedia (${filtered.length} Model)</span>
         </span>
         <span class="text-[9px] text-on-surface-variant font-normal">Pilih untuk auto-fill</span>
       </div>
@@ -1425,6 +1412,7 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
               <span class="font-bold text-xs text-on-surface truncate">${p.name || 'Sepatu Tanpa Nama'}</span>
               <div class="flex items-center gap-1 text-[9px] text-on-surface-variant">
                 <span class="font-mono font-bold glass-chip px-1 rounded text-primary">${p.barcode}</span>
+                <span class="text-[9px] text-primary font-semibold bg-primary/10 px-1 rounded">Sisa: ${p.sisaStock} psg</span>
                 ${p.kondisi === 'Minus' ? '<span class="text-amber-700 font-bold bg-amber-50 px-1 rounded border border-amber-200">Minus</span>' : '<span class="text-emerald-700 font-bold bg-emerald-50 px-1 rounded border border-emerald-200">Bagus</span>'}
               </div>
             </div>
@@ -1489,26 +1477,26 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
     if (!barcode || !barcode.trim() || barcode.trim().length < 2) return null;
     const clean = barcode.trim().toUpperCase();
 
-    // 1. Cek apakah barcode sudah ada di dalam transaksi ini
-    const trx = store.getTransactionById(targetTrxId);
-    if (trx) {
-      if (trx.barcode && trx.barcode.toString().trim().toUpperCase() === clean) {
-        return `Peringatan: Barcode "${clean}" sudah ada di dalam transaksi ini!`;
+    // Cek ketersediaan sisa stok fisik barang
+    const stockReport = store.getRealtimeStockReport();
+    const allReportItems = stockReport.items || [];
+    const stockItem = allReportItems.find((item) => {
+      if (item.hasRealBarcode && item.barcode) {
+        return item.barcode.toString().trim().toUpperCase() === clean;
       }
-      if (trx.items && Array.isArray(trx.items)) {
-        const found = trx.items.find((it) => it.barcode && it.barcode.toString().trim().toUpperCase() === clean);
-        if (found) {
-          return `Peringatan: Barcode "${clean}" sudah ada pada sepatu "${found.name || 'lain'}" di transaksi ini!`;
-        }
-      }
-    }
+      return false;
+    });
 
-    // 2. Cek apakah barcode sudah pernah terjual di transaksi lain
-    const soldTrx = store.findSoldTransactionByBarcode(clean, targetTrxId);
-    if (soldTrx) {
-      const buyerInfo = soldTrx.buyer ? `ke ${soldTrx.buyer}` : '';
-      const notaInfo = soldTrx.nota || 'transaksi lain';
-      return `Peringatan: Sepatu dengan barcode "${clean}" SUDAH PERNAH TERJUAL pada ${notaInfo} ${buyerInfo}!`;
+    if (!stockItem) {
+      const prod = store.getProductByBarcode(clean);
+      if (!prod) {
+        return `Barang dengan barcode "${clean}" tidak ditemukan di database stok.`;
+      }
+    } else if (stockItem.sisaStock <= 0) {
+      const soldTrx = store.findSoldTransactionByBarcode(clean, targetTrxId);
+      const buyerInfo = soldTrx && soldTrx.buyer ? `ke ${soldTrx.buyer}` : '';
+      const notaInfo = soldTrx && soldTrx.nota ? `pada ${soldTrx.nota}` : 'di transaksi sebelumnya';
+      return `❌ Sepatu dengan barcode "${clean}" SUDAH HABIS TERJUAL ${notaInfo} ${buyerInfo}! (Sisa stok: 0).`;
     }
 
     return null;
