@@ -1,6 +1,6 @@
 {
   "name": "Keuangan Juara Sepatu",
-  "short_name": "Keuangan Juara",
+  "short_name": "Keuangan",
   "description": "Aplikasi Buku Kas Digital Toko Keuangan Juara",
   "id": "/keuangan/",
   "start_url": "./#/dashboard",
