@@ -36,7 +36,7 @@ export default defineConfig({
       manifest: false,       // kita pakai manifest.json manual di public/
       workbox: {
         globPatterns: ['**/*.{js,css,html,png,jpg,svg,ico}'],
-        cacheId: 'kasjuara-v10',
+        cacheId: 'kasjuara-v11',
         skipWaiting: true,
         clientsClaim: true,
         cleanupOutdatedCaches: true,
