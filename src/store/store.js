@@ -1,0 +1,2754 @@
+import { INITIAL_DATA } from '../data/dummy.js';
+import { showToast } from '../components/toast.js';
+import { pushStateToSupabase, pullStateFromSupabase, subscribeToStateChanges } from '../services/supabase.js';
+import { getLocalDateString } from '../utils/date.js';
+import {
+  migrateReconcileSupplyTransactions,
+  migrateKulakan,
+  migrateShopBranch,
+  migrateRemoveDummyInventory,
+  migrateCleanProductStockField,
+  migratePurgeDummyData,
+  migrateReconcileInvestorsAndTransactions,
+  migrateAddPaymentVerification
+} from './store-migrations.js';
+
+const STORAGE_KEY = 'kas_juara_sepatu_data_v1';
+// Salinan darurat bila data tersimpan rusak / gagal diparse
+const BACKUP_KEY = 'kas_juara_sepatu_data_v1__backup';
+
+class Store {
+  constructor() {
+    this.state = this.loadState();
+    this.listeners = [];
+    this._supabaseUnsubscribe = null;
+    this._supabaseSyncTimer = null;
+    // Cache laporan stok agar tidak dihitung ulang setiap pemanggilan
+    this._stockReportCache = null;
+    // Timestamp push terakhir ke Supabase — dipakai untuk abaikan echo realtime dari diri sendiri
+    this._lastPushTimestamp = null;
+    // Inisialisasi Supabase secara async setelah UI tampil (tidak block render)
+    setTimeout(() => this._initSupabase(), 800);
+  }
+
+  /**
+   * Inisialisasi async Supabase:
+   * 1. Tarik state terbaru dari Supabase (override localStorage jika lebih baru)
+   * 2. Subscribe real-time agar update dari admin lain langsung masuk
+   */
+  async _initSupabase() {
+    try {
+      const remoteResult = await pullStateFromSupabase();
+      if (remoteResult) {
+        // Simpan timestamp cloud sebagai push terakhir agar realtime echo awal diabaikan
+        this._lastPushTimestamp = remoteResult.updatedAt || null;
+
+        // Gabungkan: gunakan remote sebagai base, pertahankan foto dari localStorage
+        const merged = this._mergeWithLocalPhotos(remoteResult.data);
+        const reconciled = this._migrateReconcileSupplyTransactions(merged);
+        this.state = merged;
+        this._stockReportCache = null;
+        this.saveState();
+        if (reconciled) {
+          const ts = new Date().toISOString();
+          this._lastPushTimestamp = ts;
+          pushStateToSupabase(this.state, ts).catch((e) => console.warn('[Supabase] Reconcile push failed:', e.message));
+        }
+        // Notifikasi listeners hanya jika halaman sudah aktif (listeners terdaftar)
+        // Ini mencegah re-render ke halaman kosong saat app baru dibuka
+        if (this.listeners.length > 0) {
+          this.listeners.forEach((fn) => {
+            try { fn(this.state); } catch (err) { console.error(err); }
+          });
+        }
+        console.log('[Supabase] State berhasil dimuat dari cloud');
+      } else {
+        // Pertama kali — push localStorage ke Supabase
+        const ts = new Date().toISOString();
+        this._lastPushTimestamp = ts;
+        await pushStateToSupabase(this.state, ts);
+        console.log('[Supabase] State lokal diunggah ke cloud (pertama kali)');
+      }
+    } catch (e) {
+      console.warn('[Supabase] Gagal inisialisasi cloud sync:', e.message);
+    }
+
+    // Subscribe real-time — abaikan echo dari push kita sendiri
+    try {
+      this._supabaseUnsubscribe = subscribeToStateChanges(
+        (newState, remoteTs) => {
+          // Abaikan jika timestamp sama dengan push terakhir kita (echo dari diri sendiri)
+          if (remoteTs && this._lastPushTimestamp && remoteTs === this._lastPushTimestamp) {
+            console.log('[Supabase] Realtime echo dari diri sendiri, diabaikan.');
+            return;
+          }
+          // Update valid dari device/admin lain
+          const merged = this._mergeWithLocalPhotos(newState);
+          this.state = merged;
+          this._stockReportCache = null;
+          this.saveState();
+          // Hanya re-render jika ada listeners (tidak selalu perlu)
+          if (this.listeners.length > 0) {
+            this.listeners.forEach((fn) => {
+              try { fn(this.state); } catch (err) { console.error(err); }
+            });
+            // Toast dinonaktifkan untuk silent sync di background
+            // showToast('Data diperbarui dari perangkat lain ✓', 'info', 2500);
+          }
+        },
+        () => this._lastPushTimestamp
+      );
+      console.log('[Supabase] Real-time sync aktif');
+    } catch (e) {
+      console.warn('[Supabase] Gagal subscribe real-time:', e.message);
+    }
+  }
+
+  /**
+   * Gabungkan state remote (tanpa foto) dengan foto dari localStorage.
+   * Foto di-skip saat push ke Supabase karena terlalu besar,
+   * jadi kita ambil foto dari localStorage yang masih ada.
+   */
+  _mergeWithLocalPhotos(remoteState) {
+    const local = this.state;
+    if (!local) return remoteState;
+
+    const photoMap = new Map();
+    // Kumpulkan foto dari products lokal
+    (local.products || []).forEach((p) => {
+      if (p.barcode && p.photo) photoMap.set(`product:${p.barcode}`, p.photo);
+    });
+    // Kumpulkan foto dari supplies lokal
+    (local.supplies || []).forEach((s) => {
+      (s.items || []).forEach((it) => {
+        if (it.barcode && it.photo) photoMap.set(`supply-item:${it.barcode}`, it.photo);
+      });
+    });
+
+    // Pasang foto ke state remote
+    const merged = JSON.parse(JSON.stringify(remoteState));
+    (merged.products || []).forEach((p) => {
+      if (p.barcode && !p.photo) p.photo = photoMap.get(`product:${p.barcode}`) || null;
+    });
+    (merged.supplies || []).forEach((s) => {
+      (s.items || []).forEach((it) => {
+        if (it.barcode && !it.photo) it.photo = photoMap.get(`supply-item:${it.barcode}`) || null;
+      });
+    });
+
+    return merged;
+  }
+
+  loadState() {
+    let stored = null;
+    try {
+      stored = localStorage.getItem(STORAGE_KEY);
+    } catch (e) {
+      console.error('Tidak dapat membaca penyimpanan browser', e);
+    }
+
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        if (!parsed.investors) {
+          parsed.investors = JSON.parse(JSON.stringify(INITIAL_DATA.investors || []));
+        }
+        if (!parsed.opnameRecords) {
+          parsed.opnameRecords = [];
+        }
+        // Migrate: rename 'Kulakan Barang' -> 'Belanja Barang' in existing data
+        migrateKulakan(parsed);
+        // Migrate: default branch name 'Cabang Veteran Bandung' -> 'Cengkareng Jakarta Barat'
+        migrateShopBranch(parsed);
+        // Migrate: hapus data contoh 'inventory' lama (alert stok kini pakai data nyata)
+        migrateRemoveDummyInventory(parsed);
+        // Migrate: hapus field 'stock' dari katalog produk (stok kini HANYA dari supplies)
+        migrateCleanProductStockField(parsed);
+        // Migrate: hapus data dummy bawaan (supplies, products, transactions contoh)
+        migratePurgeDummyData(parsed);
+        // Migrate: sinkronisasi investor & kas (hapus transaksi kas orphan bila investor telah dihapus)
+        migrateReconcileInvestorsAndTransactions(parsed);
+        // Migrate: pastikan seluruh faktur belanja lunas memiliki transaksi kas keluar yang lengkap
+        migrateReconcileSupplyTransactions(parsed);
+        // Migrate: tambahkan paymentVerification ke transaksi transfer yang sudah ada
+        migrateAddPaymentVerification(parsed);
+        return parsed;
+      } catch (e) {
+        // Data rusak: JANGAN langsung buang. Simpan salinan mentahnya ke key backup.
+        console.error('Data tersimpan rusak; salinan mentah disimpan ke key backup', e);
+        try { localStorage.setItem(BACKUP_KEY, stored); } catch (e2) { /* ignore */ }
+      }
+    }
+
+    // Fresh state: mulai dengan data bersih (tanpa dummy products/supplies)
+    const fresh = {
+      shop: JSON.parse(JSON.stringify(INITIAL_DATA.shop)),
+      transactions: [],
+      supplies: [],
+      products: [],
+      investors: [],
+      opnameRecords: []
+    };
+    this.saveState(fresh);
+    return fresh;
+  }
+
+  /**
+   * Rekonsiliasi Otomatis:
+   * Memastikan setiap faktur pengadaan belanja (supplies) yang berstatus 'lunas'
+   * memiliki transaksi kas keluar 'Belanja Barang' yang lengkap sejumlah totalAmount faktur.
+   * Mencegah ketidaksesuaian laporan pengeluaran kas dengan faktur pengadaan.
+   */
+  // ─── Migrasi dipindahkan ke src/store/store-migrations.js ──────────────────
+  // Semua method _migrate*() kini didelegasikan ke modul terpisah.
+  // Referensi di loadState() langsung memanggil fungsi yang diimport.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /** @deprecated Dipindahkan ke store-migrations.js. Tetap ada untuk kompatibilitas jika ada kode lama. */
+  _migrateReconcileSupplyTransactions(data) {
+    if (!data || !Array.isArray(data.supplies) || !Array.isArray(data.transactions)) return false;
+    let changed = false;
+
+    // Himpun nota yang telah dicatat manual di Kas Keluar ('BIAYA BELANJA SEPATU')
+    const prepaidNotaSet = new Set(
+      data.transactions
+        .filter((t) => t.type === 'keluar' && (
+          (t.category || '').toUpperCase().includes('BELANJA SEPATU') ||
+          (t.category || '').toUpperCase() === 'BIAYA BELANJA SEPATU'
+        ))
+        .map((t) => (t.nota || '').trim().toUpperCase())
+        .filter(Boolean)
+    );
+
+    data.supplies.forEach((s) => {
+      const invNo = (s.invoiceNo || '').trim();
+      if (!invNo) return;
+      const isPrepaidByTrx = prepaidNotaSet.has(invNo.toUpperCase());
+
+      // Jika faktur ini adalah pre-paid atau tersambung ke kas keluar BIAYA BELANJA SEPATU:
+      if (s.status === 'pre-paid' || isPrepaidByTrx) {
+        if (s.status !== 'pre-paid') {
+          s.status = 'pre-paid';
+          changed = true;
+        }
+        // Bersihkan transaksi kas keluar duplikat 'Belanja Barang' / 'Tambah Belanja' yang pernah terbuat otomatis
+        const prevTrxCount = data.transactions.length;
+        data.transactions = data.transactions.filter((t) => {
+          if (t.type === 'keluar' && ((t.nota || '').trim().toUpperCase() === invNo.toUpperCase())) {
+            const cat = (t.category || '').trim();
+            if (cat === 'Belanja Barang' || cat === 'Belanja' || (t.title || '').startsWith('Tambah Belanja:')) {
+              return false;
+            }
+          }
+          return true;
+        });
+        if (data.transactions.length !== prevTrxCount) {
+          changed = true;
+        }
+        return; // Pre-paid: TIDAK PERNAH membuat kas keluar otomatis
+      }
+
+      if (s.status !== 'lunas') return; // 'tempo' dilewati — tidak perlu rekonsiliasi kas keluar
+
+      const expectedTotal = Number(s.totalAmount) || 0;
+      if (expectedTotal <= 0) return;
+
+      // Cari transaksi keluar yang terhubung ke faktur ini
+      const existingTrxs = data.transactions.filter(
+        (t) => t.type === 'keluar' &&
+          (t.category === 'Belanja Barang' || t.category === 'Belanja') &&
+          ((t.nota || '').trim().toUpperCase() === invNo.toUpperCase())
+      );
+
+      const existingTotal = existingTrxs.reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+
+      // Jika nominal kas keluar belanja kurang dari total faktur:
+      if (existingTotal < expectedTotal) {
+        if (s.items && Array.isArray(s.items) && s.items.length > 0) {
+          // Hapus transaksi parsial faktur ini dan bangun ulang secara akurat per-item
+          data.transactions = data.transactions.filter(
+            (t) => !(t.type === 'keluar' && (t.category === 'Belanja Barang' || t.category === 'Belanja') && ((t.nota || '').trim().toUpperCase() === invNo.toUpperCase()))
+          );
+
+          s.items.forEach((it, idx) => {
+            const itemQty = Number(it.qty) || 1;
+            const itemPrice = Number(it.buyPrice) || 0;
+            const itemTotal = itemQty * itemPrice;
+            const title = idx === 0
+              ? `Belanja ${s.supplierName || 'Stok'} (1 pasang)`
+              : `Tambah Belanja: ${it.name || 'TB'} (${s.supplierName || 'Stok'})`;
+
+            data.transactions.push({
+              id: `TRX-${Date.now()}-${idx}-${Math.floor(100 + Math.random() * 900)}`,
+              date: s.date || '2026-10-16',
+              nota: invNo,
+              time: '14.00 WIB',
+              type: 'keluar',
+              title: title,
+              amount: itemTotal,
+              category: 'Belanja Barang',
+              paymentMethod: s.paymentMethod || 'Tunai (Laci)',
+              shippingNote: null,
+              shippingResi: null,
+              shippingStatus: null,
+              shippingCourier: null
+            });
+          });
+          changed = true;
+        } else {
+          // Tambahkan selisih nominal yang kurang
+          const diff = expectedTotal - existingTotal;
+          data.transactions.push({
+            id: `TRX-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
+            date: s.date || '2026-10-16',
+            nota: invNo,
+            time: '14.00 WIB',
+            type: 'keluar',
+            title: `Belanja ${s.supplierName || 'Stok'}`,
+            amount: diff,
+            category: 'Belanja Barang',
+            paymentMethod: s.paymentMethod || 'Tunai (Laci)',
+            shippingNote: null,
+            shippingResi: null,
+            shippingStatus: null,
+            shippingCourier: null
+          });
+          changed = true;
+        }
+      }
+    });
+
+    if (changed) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+    return changed;
+  }
+
+  _migrateKulakan(data) {
+    let changed = false;
+    if (data.transactions && Array.isArray(data.transactions)) {
+      data.transactions.forEach((t) => {
+        if (t.category && t.category.toLowerCase().includes('kulakan')) {
+          t.category = t.category.replace(/[Kk]ulakan/g, 'Belanja');
+          changed = true;
+        }
+        if (t.title && t.title.toLowerCase().includes('kulakan')) {
+          t.title = t.title.replace(/[Kk]ulakan/g, 'Belanja');
+          changed = true;
+        }
+      });
+    }
+    if (data.investors && Array.isArray(data.investors)) {
+      data.investors.forEach((inv) => {
+        if (inv.notes && inv.notes.toLowerCase().includes('kulakan')) {
+          inv.notes = inv.notes.replace(/[Kk]ulakan/g, 'Belanja');
+          changed = true;
+        }
+      });
+    }
+    if (changed) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  _migrateShopBranch(data) {
+    if (data && data.shop && data.shop.subName === 'Cabang Veteran Bandung') {
+      data.shop.subName = 'Cengkareng Jakarta Barat';
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  _migrateRemoveDummyInventory(data) {
+    // `inventory` adalah data contoh lama yang tidak pernah diubah/diisi aplikasi.
+    // Dihapus agar alert "Stok Menipis" memakai perhitungan dari data nyata.
+    if (data && Object.prototype.hasOwnProperty.call(data, 'inventory')) {
+      delete data.inventory;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  /**
+   * Migrasi: Hapus field 'stock' / 'qty' dari katalog produk.
+   * Sebelumnya katalog produk punya field 'stock' (misal 10, 12, 5) yang
+   * dipakai sebagai sumber stok di laporan — ini menyebabkan produk tetap muncul
+   * di laporan sisa stock meski faktur belanjanya sudah dihapus.
+   * Mulai versi ini: sumber stok HANYA dari supplies (faktur belanja).
+   * Products hanya metadata (nama, harga, foto, kondisi).
+   */
+  _migrateCleanProductStockField(data) {
+    if (!data || !Array.isArray(data.products) || data.products.length === 0) return;
+    let changed = false;
+    data.products = data.products.map((p) => {
+      if (Object.prototype.hasOwnProperty.call(p, 'stock') ||
+          Object.prototype.hasOwnProperty.call(p, 'qty')) {
+        const { stock, qty, ...rest } = p; // eslint-disable-line no-unused-vars
+        changed = true;
+        return rest;
+      }
+      return p;
+    });
+    if (changed) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  /**
+   * Migrasi: Hapus data dummy bawaan aplikasi dari localStorage.
+   * Data yang dihapus:
+   *  - Faktur belanja contoh: PASOK-01, PASOK-02, PASOK-03
+   *  - Transaksi contoh: TRX-101 s/d TRX-110
+   *  - Produk katalog dengan barcode contoh (SP-2024-0089, VENTELA-41, PIERO-JGR, SLOP-KLT)
+   *    hanya jika TIDAK ada lagi supply yang memiliki barcode yang sama (data pengguna aman).
+   * Data pengguna yang asli tidak disentuh.
+   */
+  _migratePurgeDummyData(data) {
+    if (!data) return;
+    const DUMMY_SUPPLY_IDS = ['PASOK-01', 'PASOK-02', 'PASOK-03'];
+    const DUMMY_TRX_IDS = ['TRX-101', 'TRX-102', 'TRX-103', 'TRX-104', 'TRX-105',
+                           'TRX-106', 'TRX-107', 'TRX-108', 'TRX-109', 'TRX-110'];
+    const DUMMY_BARCODES = new Set(['SP-2024-0089', 'VENTELA-41', 'PIERO-JGR', 'SLOP-KLT', 'OXFORD-42']);
+
+    let changed = false;
+
+    // Hapus supplies dummy
+    if (Array.isArray(data.supplies)) {
+      const before = data.supplies.length;
+      data.supplies = data.supplies.filter((s) => !DUMMY_SUPPLY_IDS.includes(s.id));
+      if (data.supplies.length !== before) changed = true;
+    }
+
+    // Hapus transaksi dummy
+    if (Array.isArray(data.transactions)) {
+      const before = data.transactions.length;
+      data.transactions = data.transactions.filter((t) => !DUMMY_TRX_IDS.includes(t.id));
+      if (data.transactions.length !== before) changed = true;
+    }
+
+    // Hapus produk katalog dummy — hanya jika tidak ada supply real yang masih memakainya
+    if (Array.isArray(data.products)) {
+      // Kumpulkan barcode yang masih dipakai oleh supplies yang tersisa (non-dummy)
+      const usedBarcodes = new Set();
+      (data.supplies || []).forEach((sup) => {
+        if (Array.isArray(sup.items)) {
+          sup.items.forEach((it) => {
+            if (it.barcode) usedBarcodes.add(it.barcode.toString().trim().toUpperCase());
+          });
+        }
+      });
+      const before = data.products.length;
+      data.products = data.products.filter((p) => {
+        if (!p.barcode) return true;
+        const bc = p.barcode.toString().trim().toUpperCase();
+        // Hapus jika barcode dummy DAN tidak dipakai oleh supply yang tersisa
+        return !(DUMMY_BARCODES.has(bc) && !usedBarcodes.has(bc));
+      });
+      if (data.products.length !== before) changed = true;
+    }
+
+    if (changed) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  /**
+   * Rekonsiliasi data investor dengan buku kas (transactions):
+   * 1. Hapus transaksi kas masuk bertipe 'Dana Investor' yang investor aslinya sudah dihapus.
+   * 2. Pastikan investor aktif tertaut secara dua arah dengan transaksi kas masuknya.
+   */
+  _migrateReconcileInvestorsAndTransactions(data) {
+    if (!data || !Array.isArray(data.transactions)) return;
+    const investors = Array.isArray(data.investors) ? data.investors : [];
+    let changed = false;
+
+    const validInvestorIds = new Set(investors.map((i) => i.id));
+    const validInvestorTrxIds = new Set(investors.map((i) => i.trxId).filter(Boolean));
+    const validInvestorNames = investors
+      .map((i) => (i.investorName || '').toLowerCase().trim())
+      .filter(Boolean);
+
+    const initialTrxCount = data.transactions.length;
+    data.transactions = data.transactions.filter((t) => {
+      const isInvestorTrx =
+        t.category === 'Dana Investor' ||
+        t.category === 'Investasi Modal' ||
+        t.sourceType === 'investor' ||
+        (typeof t.nota === 'string' && t.nota.startsWith('#INV-'));
+
+      if (!isInvestorTrx) return true;
+
+      // Jika tidak ada data investor aktif sama sekali, semua transaksi Dana Investor adalah orphan
+      if (investors.length === 0) {
+        changed = true;
+        return false;
+      }
+
+      // Cocok berdasarkan ID investor
+      if (t.investorId && validInvestorIds.has(t.investorId)) {
+        return true;
+      }
+
+      // Cocok berdasarkan ID transaksi investor
+      if (validInvestorTrxIds.has(t.id)) {
+        return true;
+      }
+
+      // Cocokkan judul/nama investor yang masih ada
+      const titleLower = (t.title || '').toLowerCase();
+      const matchingInv = investors.find((inv) => {
+        const name = (inv.investorName || '').toLowerCase().trim();
+        return name && titleLower.includes(name);
+      });
+
+      if (matchingInv) {
+        if (!matchingInv.trxId) matchingInv.trxId = t.id;
+        t.investorId = matchingInv.id;
+        t.sourceType = 'investor';
+        changed = true;
+        return true;
+      }
+
+      // Transaksi ini milik data investor yang sudah tidak ada -> hapus dari kas!
+      changed = true;
+      return false;
+    });
+
+    // Pastikan investor yang aktif memiliki referensi transaksi kas yang valid
+    investors.forEach((inv) => {
+      let trx = null;
+      if (inv.trxId) {
+        trx = data.transactions.find((t) => t.id === inv.trxId);
+      }
+      if (!trx) {
+        trx = data.transactions.find((t) => t.investorId === inv.id);
+      }
+      if (!trx) {
+        const invName = (inv.investorName || '').toLowerCase().trim();
+        trx = data.transactions.find((t) =>
+          (t.category === 'Dana Investor' || t.category === 'Investasi Modal' || (typeof t.nota === 'string' && t.nota.startsWith('#INV-'))) &&
+          invName &&
+          t.title &&
+          t.title.toLowerCase().includes(invName)
+        );
+      }
+
+      if (trx) {
+        if (inv.trxId !== trx.id) {
+          inv.trxId = trx.id;
+          changed = true;
+        }
+        if (trx.investorId !== inv.id) {
+          trx.investorId = inv.id;
+          changed = true;
+        }
+        if (trx.sourceType !== 'investor') {
+          trx.sourceType = 'investor';
+          changed = true;
+        }
+      }
+    });
+
+    if (changed || data.transactions.length !== initialTrxCount) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  /**
+   * Migration: Tambahkan field paymentVerification ke SEMUA transaksi masuk
+   * Semua penjualan adalah transfer yang perlu verifikasi
+   */
+  _migrateAddPaymentVerification(data) {
+    if (!data || !Array.isArray(data.transactions)) return;
+    let changed = false;
+
+    data.transactions.forEach((trx) => {
+      // Hanya untuk transaksi masuk (penjualan), kecuali investor
+      if (trx.type !== 'masuk') return;
+      
+      const isInvestor = trx.category === 'Dana Investor' || 
+                        trx.category === 'Investasi Modal' ||
+                        trx.sourceType === 'investor';
+      
+      if (isInvestor) return; // Skip investor
+      
+      if (!trx.paymentVerification) {
+        // Tambahkan field paymentVerification dengan status pending
+        trx.paymentVerification = {
+          status: 'pending',
+          verifiedAt: null,
+          verifiedBy: null,
+          notes: ''
+        };
+        changed = true;
+        console.log('[Migration] Added verification to:', trx.title);
+      }
+    });
+
+    if (changed) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        console.log('[Migration] Payment verification fields added to all kas masuk transactions');
+      } catch (e) { /* ignore */ }
+    } else {
+      console.log('[Migration] All kas masuk transactions already have verification field');
+    }
+  }
+
+  /**
+   * Simpan state ke localStorage.
+   * Mengembalikan true bila berhasil. Bila kuota browser penuh, otomatis
+   * mencoba menyimpan versi ringkas (tanpa foto) supaya data transaksi & stok
+   * tidak hilang, lalu memberi peringatan kepada pengguna.
+   */
+  saveState(newState) {
+    const data = newState || this.state;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      this._saveErrorShown = false;
+      return true;
+    } catch (e) {
+      console.error('Gagal menyimpan ke localStorage', e);
+
+      // Fallback: simpan tanpa foto agar data penting tetap tersimpan
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(this._stripPhotos(data)));
+        this._warnSaveOnce('Penyimpanan browser penuh. Foto tidak ikut tersimpan, tetapi data transaksi & stok tetap aman.');
+        return false;
+      } catch (e2) {
+        console.error('Gagal menyimpan versi ringkas', e2);
+      }
+
+      this._warnSaveOnce('GAGAL menyimpan data ke browser! Segera lakukan Backup (Ekspor JSON) atau sinkronkan ke Google Sheets.');
+      return false;
+    }
+  }
+
+  _warnSaveOnce(message) {
+    if (this._saveErrorShown) return;
+    this._saveErrorShown = true;
+    try { showToast(message, 'error', 6000); } catch (e) { /* ignore */ }
+  }
+
+  /** Salinan state tanpa data foto (fallback saat kuota penyimpanan penuh). */
+  _stripPhotos(data) {
+    const clone = JSON.parse(JSON.stringify(data || {}));
+    const stripItem = (it) => { if (it && typeof it === 'object' && it.photo) delete it.photo; };
+    (clone.transactions || []).forEach((t) => {
+      stripItem(t);
+      if (Array.isArray(t.items)) t.items.forEach(stripItem);
+    });
+    (clone.supplies || []).forEach((s) => {
+      if (Array.isArray(s.items)) s.items.forEach(stripItem);
+    });
+    (clone.products || []).forEach(stripItem);
+    return clone;
+  }
+
+  notify() {
+    // Invalidasi cache laporan stok setiap kali data berubah
+    this._stockReportCache = null;
+    this.saveState();
+    this.listeners.forEach((fn) => {
+      try { fn(this.state); } catch (err) { console.error(err); }
+    });
+    this.triggerSupabaseSync();
+    this.triggerAutoSync();
+  }
+
+  /**
+   * Push state ke Supabase secara debounced (5 detik) setelah setiap perubahan.
+   * Simpan timestamp push agar realtime echo dari diri sendiri bisa diabaikan.
+   */
+  triggerSupabaseSync() {
+    if (this._supabaseSyncTimer) clearTimeout(this._supabaseSyncTimer);
+    this._supabaseSyncTimer = setTimeout(async () => {
+      try {
+        const ts = new Date().toISOString();
+        this._lastPushTimestamp = ts;
+        await pushStateToSupabase(this.state, ts);
+      } catch (e) {
+        console.warn('[Supabase] Sync gagal:', e.message);
+      }
+    }, 5000); // 5 detik debounce — lebih hemat request
+  }
+
+  triggerAutoSync() {
+    const cfg = this.getGoogleSheetsConfig();
+    if (!cfg || !cfg.autoSync || !cfg.spreadsheetId) return;
+
+    if (this._autoSyncTimer) clearTimeout(this._autoSyncTimer);
+    this._autoSyncTimer = setTimeout(async () => {
+      try {
+        const { syncAllToGoogleSheets } = await import('../services/googleSheets.js');
+        await syncAllToGoogleSheets(this);
+        console.log('[GoogleSheets] Background auto-sync completed');
+      } catch (e) {
+        console.warn('[GoogleSheets] Auto-sync failed:', e.message);
+      }
+    }, 2500);
+  }
+
+  subscribe(fn) {
+    this.listeners.push(fn);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== fn);
+    };
+  }
+
+  // Shop Info
+  getShop() {
+    // Defensive: kembalikan default shop jika state.shop undefined (mis. data Supabase belum lengkap)
+    return this.state.shop || JSON.parse(JSON.stringify(INITIAL_DATA.shop));
+  }
+
+  updateShop(shopData) {
+    this.state.shop = { ...this.state.shop, ...shopData };
+    this.notify();
+  }
+
+  // ── Role Management (Admin vs Atasan) ─────────────────────────────────────
+  /**
+   * Dapatkan role yang sedang aktif dari sessionStorage.
+   * @returns {'admin'|'atasan'|null}
+   */
+  getRole() {
+    try {
+      return sessionStorage.getItem('kas_juara_role') || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Set role setelah login berhasil.
+   * @param {'admin'|'atasan'} role
+   */
+  setRole(role) {
+    try {
+      sessionStorage.setItem('kas_juara_role', role);
+    } catch (e) {
+      console.warn('[Role] Gagal menyimpan role:', e.message);
+    }
+  }
+
+  /**
+   * Cek apakah user yang login adalah Admin.
+   * @returns {boolean}
+   */
+  isAdmin() {
+    return this.getRole() === 'admin';
+  }
+
+  /**
+   * Logout: hapus role dari session dan redirect ke login.
+   */
+  logout() {
+    try {
+      sessionStorage.removeItem('kas_juara_role');
+    } catch (e) { /* ignore */ }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Transactions
+  getTransactions() {
+    return this.state.transactions || [];
+  }
+
+  getInvestors() {
+    return this.state.investors || [];
+  }
+
+  addTransaction(trx) {
+    const isInvestor = trx.category === 'Dana Investor' || trx.category === 'Investasi Modal';
+    
+    const newTrx = {
+      id: `TRX-${Date.now()}`,
+      date: trx.date || getLocalDateString(),
+      time: trx.time || new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }) + ' WIB',
+      nota: trx.nota || `#NOTA-${Math.floor(1000 + Math.random() * 9000)}`,
+      shippingStatus: trx.shippingStatus !== undefined ? trx.shippingStatus : (trx.type === 'masuk' && !isInvestor ? 'kemas' : null),
+      shippingCourier: trx.shippingCourier || null,
+      shippingResi: trx.shippingResi || null,
+      shippingNote: trx.shippingNote || null,
+      // Payment verification - SEMUA transaksi masuk perlu verifikasi
+      paymentVerification: trx.paymentVerification || (trx.type === 'masuk' && !isInvestor ? {
+        status: 'pending',      // pending | verified | problematic
+        verifiedAt: null,
+        verifiedBy: null,
+        notes: ''
+      } : null),
+      ...trx
+    };
+    this.state.transactions.unshift(newTrx);
+    this.notify();
+    return newTrx;
+  }
+
+  getTransactionById(id) {
+    return this.state.transactions.find((t) => t.id === id) || null;
+  }
+
+  updateTransaction(id, updatedData) {
+    const idx = this.state.transactions.findIndex((t) => t.id === id);
+    if (idx !== -1) {
+      this.state.transactions[idx] = { ...this.state.transactions[idx], ...updatedData };
+      this.notify();
+      return this.state.transactions[idx];
+    }
+    return null;
+  }
+
+  deleteTransaction(id) {
+    const trx = (this.state.transactions || []).find((t) => t.id === id);
+    this.state.transactions = (this.state.transactions || []).filter((t) => t.id !== id);
+
+    // Jika transaksi yang dihapus tertaut ke investor, lepaskan referensinya
+    if (Array.isArray(this.state.investors)) {
+      this.state.investors.forEach((inv) => {
+        if (inv.trxId === id || (trx && trx.investorId === inv.id)) {
+          inv.trxId = null;
+        }
+      });
+    }
+
+    this.notify();
+
+    // Push segera ke Supabase agar penghapusan transaksi permanen
+    setTimeout(async () => {
+      try {
+        const ts = new Date().toISOString();
+        this._lastPushTimestamp = ts;
+        await pushStateToSupabase(this.state, ts);
+        console.log('[Store] deleteTransaction pushed to Supabase immediately');
+      } catch (e) {
+        console.warn('[Store] Failed to push deleteTransaction to Supabase:', e.message);
+      }
+    }, 500);
+  }
+
+  /**
+   * Verifikasi pembayaran transfer (tandai sudah dicek di mutasi rekening)
+   * @param {string} id - Transaction ID
+   * @param {string} status - 'verified' atau 'problematic'
+   * @param {string} notes - Catatan opsional (untuk problematic)
+   * @param {string} adminName - Nama admin yang verifikasi
+   */
+  verifyPayment(id, status = 'verified', notes = '', adminName = 'Admin') {
+    const idx = this.state.transactions.findIndex((t) => t.id === id);
+    if (idx !== -1) {
+      const trx = this.state.transactions[idx];
+      if (!trx.paymentVerification) {
+        trx.paymentVerification = {};
+      }
+      trx.paymentVerification.status = status;
+      trx.paymentVerification.verifiedAt = new Date().toISOString();
+      trx.paymentVerification.verifiedBy = adminName;
+      trx.paymentVerification.notes = notes || '';
+      
+      this.notify();
+      return trx;
+    }
+    return null;
+  }
+
+  /**
+   * Bulk verifikasi pembayaran (untuk multiple transaksi sekaligus)
+   * @param {string[]} ids - Array of transaction IDs
+   * @param {string} status - 'verified' atau 'problematic'
+   * @param {string} adminName - Nama admin yang verifikasi
+   */
+  bulkVerifyPayments(ids, status = 'verified', adminName = 'Admin') {
+    let count = 0;
+    ids.forEach((id) => {
+      const result = this.verifyPayment(id, status, '', adminName);
+      if (result) count++;
+    });
+    return count;
+  }
+
+  /**
+   * Reset status verifikasi (kembali ke pending)
+   * @param {string} id - Transaction ID
+   */
+  resetPaymentVerification(id) {
+    const idx = this.state.transactions.findIndex((t) => t.id === id);
+    if (idx !== -1 && this.state.transactions[idx].paymentVerification) {
+      this.state.transactions[idx].paymentVerification.status = 'pending';
+      this.state.transactions[idx].paymentVerification.verifiedAt = null;
+      this.state.transactions[idx].paymentVerification.verifiedBy = null;
+      this.state.transactions[idx].paymentVerification.notes = '';
+      this.notify();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Dapatkan statistik verifikasi pembayaran
+   */
+  getPaymentVerificationStats() {
+    const transactions = this.getTransactions();
+    // SEMUA transaksi masuk (kecuali investor) perlu verifikasi
+    const transferTransactions = transactions.filter((t) => {
+      if (t.type !== 'masuk') return false;
+      // Skip transaksi investor
+      const isInvestor = t.category === 'Dana Investor' || 
+                        t.category === 'Investasi Modal' ||
+                        t.sourceType === 'investor';
+      return !isInvestor;
+    });
+
+    const pending = transferTransactions.filter((t) => 
+      t.paymentVerification && t.paymentVerification.status === 'pending'
+    );
+    
+    const verified = transferTransactions.filter((t) => 
+      t.paymentVerification && t.paymentVerification.status === 'verified'
+    );
+    
+    const problematic = transferTransactions.filter((t) => 
+      t.paymentVerification && t.paymentVerification.status === 'problematic'
+    );
+
+    // Cek transaksi pending dari kemarin atau lebih lama
+    const today = getLocalDateString();
+    const oldPending = pending.filter((t) => t.date && t.date < today);
+
+    return {
+      total: transferTransactions.length,
+      totalAmount: transferTransactions.reduce((sum, t) => sum + (t.amount || 0), 0),
+      pending: {
+        count: pending.length,
+        amount: pending.reduce((sum, t) => sum + (t.amount || 0), 0),
+        transactions: pending
+      },
+      verified: {
+        count: verified.length,
+        amount: verified.reduce((sum, t) => sum + (t.amount || 0), 0),
+        transactions: verified
+      },
+      problematic: {
+        count: problematic.length,
+        amount: problematic.reduce((sum, t) => sum + (t.amount || 0), 0),
+        transactions: problematic
+      },
+      oldPending: {
+        count: oldPending.length,
+        amount: oldPending.reduce((sum, t) => sum + (t.amount || 0), 0),
+        transactions: oldPending
+      }
+    };
+  }
+
+  // Supplies (Barang Masuk)
+  getSupplies() {
+    return this.state.supplies || [];
+  }
+
+  addSupply(supply) {
+    const newSupply = {
+      id: `PASOK-${Date.now()}`,
+      invoiceNo: supply.invoiceNo || `${((supply.supplierName || 'BALL').trim().toUpperCase().replace(/\s+/g, '').replace(/[^A-Z0-9_-]/g, '')) || 'BALL'}-${Math.floor(100 + Math.random() * 900)}`,
+      date: supply.date || getLocalDateString(),
+      status: supply.status || 'lunas',
+      ...supply
+    };
+    this.state.supplies.unshift(newSupply);
+
+    // Auto-upsert each item with barcode into master products catalog
+    if (supply.items && Array.isArray(supply.items)) {
+      supply.items.forEach((it) => {
+        if (it.barcode) {
+          this.upsertProduct({
+            barcode: it.barcode,
+            name: it.name,
+            kondisi: it.kondisi || 'Bagus',
+            catatanMinus: it.catatanMinus || '',
+            photo: it.photo || null,
+            buyPrice: it.buyPrice,
+            supplier: supply.supplierName,
+            date: supply.date,
+            qty: it.qty
+          });
+        }
+      });
+    }
+
+    // If paid immediately (lunas), also record a cash out transaction!
+    // 'pre-paid' = sudah dibayar sebelumnya (via kas keluar manual) → stok masuk, kas TIDAK dipotong lagi
+    // 'tempo'    = bayar nanti ke supplier → stok masuk, kas TIDAK dipotong sekarang
+    const isAlreadyPrepaid = (this.state.transactions || []).some(
+      (t) => t.type === 'keluar' &&
+        ((t.category || '').toUpperCase().includes('BELANJA SEPATU') || (t.category || '').toUpperCase() === 'BIAYA BELANJA SEPATU') &&
+        (t.nota || '').trim().toUpperCase() === (newSupply.invoiceNo || '').trim().toUpperCase()
+    );
+    if (isAlreadyPrepaid) {
+      newSupply.status = 'pre-paid';
+    }
+
+    if (newSupply.status === 'lunas' && supply.recordTransaction !== false && !isAlreadyPrepaid) {
+      this.addTransaction({
+        type: 'keluar',
+        category: 'Belanja Barang',
+        amount: supply.totalAmount,
+        title: `Belanja ${supply.supplierName} (${supply.itemsCount || 1} pasang)`,
+        paymentMethod: supply.paymentMethod || 'Tunai (Laci)',
+        nota: newSupply.invoiceNo
+      });
+    }
+    // 'pre-paid': no cash out recorded here — payment was already registered manually
+
+    this.notify();
+    return newSupply;
+  }
+
+  getSupplyById(id) {
+    return this.state.supplies.find((s) => s.id === id) || null;
+  }
+
+  updateSupply(id, updatedData) {
+    const idx = this.state.supplies.findIndex((s) => s.id === id);
+    if (idx !== -1) {
+      const existing = this.state.supplies[idx];
+      let updatedItems = updatedData.items;
+      if (!updatedItems && updatedData.itemName && existing.items && existing.items.length > 0) {
+        updatedItems = [{
+          ...existing.items[0],
+          name: updatedData.itemName,
+          barcode: updatedData.barcode || existing.items[0].barcode,
+          kondisi: updatedData.kondisi || existing.items[0].kondisi,
+          catatanMinus: updatedData.catatanMinus !== undefined ? updatedData.catatanMinus : existing.items[0].catatanMinus,
+          photo: updatedData.photo !== undefined ? updatedData.photo : existing.items[0].photo,
+          buyPrice: updatedData.unitPrice || existing.items[0].buyPrice,
+          qty: updatedData.quantity || existing.items[0].qty
+        }];
+      }
+
+      this.state.supplies[idx] = { 
+        ...existing, 
+        ...updatedData, 
+        ...(updatedItems ? { items: updatedItems } : {}) 
+      };
+      
+      // Update catalog products if items provided
+      const catalogItems = updatedItems || existing.items;
+      if (catalogItems && Array.isArray(catalogItems)) {
+        catalogItems.forEach((it) => {
+          if (it.barcode) {
+            this.upsertProduct({
+              barcode: it.barcode,
+              name: it.name,
+              kondisi: it.kondisi || 'Bagus',
+              catatanMinus: it.catatanMinus || '',
+              photo: it.photo || null,
+              buyPrice: it.buyPrice,
+              supplier: updatedData.supplierName || this.state.supplies[idx].supplierName,
+              date: updatedData.date || this.state.supplies[idx].date,
+              qty: it.qty
+            });
+          }
+        });
+      }
+
+      // Sync transaction kas keluar jika ada (HANYA untuk status 'lunas' dan kategori 'Belanja Barang'/'Belanja')
+      // Pre-paid & Tempo TIDAK PERNAH memodifikasi kas keluar
+      const existingNota = (existing.invoiceNo || '').trim().toUpperCase();
+      const targetStatus = updatedData.status || existing.status;
+      if (existingNota && updatedData.totalAmount !== undefined && targetStatus === 'lunas') {
+        const trxs = this.state.transactions || [];
+        const relatedTrx = trxs.find(
+          (t) => t.type === 'keluar' &&
+            (t.category === 'Belanja Barang' || t.category === 'Belanja') &&
+            (t.nota || '').trim().toUpperCase() === existingNota
+        );
+        if (relatedTrx) {
+          relatedTrx.amount = Number(updatedData.totalAmount) || 0;
+          if (updatedData.supplierName) {
+            const count = updatedData.itemsCount || (updatedItems ? updatedItems.length : 1);
+            relatedTrx.title = `Belanja ${updatedData.supplierName} (${count} pasang)`;
+          }
+          if (updatedData.date) {
+            relatedTrx.date = updatedData.date;
+          }
+        }
+      }
+
+      this.saveState();
+      this.notify();
+      return this.state.supplies[idx];
+    }
+    return null;
+  }
+
+  addItemToSupply(id, newItem, appendStatus = null) {
+    const idx = this.state.supplies.findIndex((s) => s.id === id);
+    if (idx === -1) return null;
+    const existing = this.state.supplies[idx];
+    const invNo = (existing.invoiceNo || '').trim().toUpperCase();
+
+    // Cek apakah faktur terhubung ke Kas Keluar BIAYA BELANJA SEPATU
+    const isPrepaidByTrx = invNo && (this.state.transactions || []).some(
+      (t) => t.type === 'keluar' && 
+        ((t.category || '').toUpperCase().includes('BELANJA SEPATU') || (t.category || '').toUpperCase() === 'BIAYA BELANJA SEPATU') &&
+        (t.nota || '').trim().toUpperCase() === invNo
+    );
+
+    // Default status: utamakan appendStatus jika diberikan, jika tidak gunakan pre-paid bila terhubung ke kas keluar / pre-paid
+    let effectiveStatus = appendStatus;
+    if (!effectiveStatus) {
+      effectiveStatus = (isPrepaidByTrx || existing.status === 'pre-paid') ? 'pre-paid' : (existing.status || 'pre-paid');
+    }
+    // Jika faktur memang terhubung ke transaksi belanja kas keluar manual, selalu pastikan pre-paid (kecuali tempo)
+    if (isPrepaidByTrx && effectiveStatus !== 'tempo') {
+      effectiveStatus = 'pre-paid';
+    }
+
+    const currentItems = Array.isArray(existing.items) ? [...existing.items] : [];
+    currentItems.push(newItem);
+
+    const totalAmount = currentItems.reduce((sum, it) => sum + ((Number(it.buyPrice) || 0) * (Number(it.qty) || 1)), 0);
+    const itemsCount = currentItems.reduce((sum, it) => sum + (Number(it.qty) || 1), 0);
+
+    const updated = this.updateSupply(id, {
+      items: currentItems,
+      totalAmount: totalAmount,
+      itemsCount: itemsCount,
+      status: effectiveStatus
+    });
+
+    // Record cash out ONLY if effectiveStatus is 'lunas' (bukan pre-paid atau tempo) dan bukan terhubung ke kas keluar manual
+    if (effectiveStatus === 'lunas' && !isPrepaidByTrx) {
+      const addedAmount = (Number(newItem.buyPrice) || 0) * (Number(newItem.qty) || 1);
+      this.addTransaction({
+        type: 'keluar',
+        category: 'Belanja Barang',
+        amount: addedAmount,
+        title: `Tambah Belanja: ${newItem.name} (${existing.supplierName})`,
+        paymentMethod: existing.paymentMethod || 'Tunai (Laci)',
+        nota: existing.invoiceNo
+      });
+    } else {
+      // Jika statusnya pre-paid, pastikan membersihkan transaksi duplikat 'Belanja Barang' / 'Tambah Belanja' yang mungkin pernah terbuat
+      if (effectiveStatus === 'pre-paid' || isPrepaidByTrx) {
+        const prevCount = this.state.transactions ? this.state.transactions.length : 0;
+        this.state.transactions = (this.state.transactions || []).filter(
+          (t) => !(t.type === 'keluar' && ((t.nota || '').trim().toUpperCase() === invNo) && (t.category === 'Belanja Barang' || t.category === 'Belanja' || (t.title || '').startsWith('Tambah Belanja:')))
+        );
+        if (this.state.transactions.length !== prevCount) {
+          this.saveState();
+        }
+      }
+    }
+
+    return updated;
+  }
+
+  deleteSupply(id) {
+    // Kumpulkan barcode dari supply yang akan dihapus
+    const supplyToDelete = this.state.supplies.find((s) => s.id === id);
+    const deletedBarcodes = new Set();
+    if (supplyToDelete && Array.isArray(supplyToDelete.items)) {
+      supplyToDelete.items.forEach((it) => {
+        if (it.barcode) deletedBarcodes.add(it.barcode.toString().trim().toUpperCase());
+      });
+    }
+
+    // Hapus supply
+    this.state.supplies = this.state.supplies.filter((s) => s.id !== id);
+
+    // Hapus transaksi yang terkait dengan supply (berdasarkan nota)
+    if (supplyToDelete && supplyToDelete.invoiceNo) {
+      this.state.transactions = (this.state.transactions || []).filter((t) => t.nota !== supplyToDelete.invoiceNo);
+    }
+
+    // Hapus produk dari katalog yang tidak lagi direferensikan oleh supply manapun
+    if (deletedBarcodes.size > 0) {
+      const remainingBarcodes = new Set();
+      this.state.supplies.forEach((sup) => {
+        if (Array.isArray(sup.items)) {
+          sup.items.forEach((it) => {
+            if (it.barcode) remainingBarcodes.add(it.barcode.toString().trim().toUpperCase());
+          });
+        }
+      });
+      // Hapus dari catalog produk jika barcode tidak ada di supply manapun
+      if (Array.isArray(this.state.products)) {
+        this.state.products = this.state.products.filter((p) => {
+          if (!p.barcode) return true; // Pertahankan produk tanpa barcode
+          const bc = p.barcode.toString().trim().toUpperCase();
+          return !deletedBarcodes.has(bc) || remainingBarcodes.has(bc);
+        });
+      }
+    }
+
+    this.notify();
+    
+    // Push segera ke Supabase (jangan tunggu 5 detik debounce)
+    // untuk memastikan perubahan langsung tersimpan permanent
+    setTimeout(async () => {
+      try {
+        const ts = new Date().toISOString();
+        this._lastPushTimestamp = ts;
+        await pushStateToSupabase(this.state, ts);
+        console.log('[Store] deleteSupply pushed to Supabase immediately');
+      } catch (e) {
+        console.warn('[Store] Failed to push deleteSupply to Supabase:', e.message);
+      }
+    }, 500);
+  }
+
+  mergeSupplyInto(sourceSupplyId, targetSupplyId) {
+    if (!sourceSupplyId || !targetSupplyId || sourceSupplyId === targetSupplyId) return false;
+    const source = (this.state.supplies || []).find((s) => s.id === sourceSupplyId);
+    const target = (this.state.supplies || []).find((s) => s.id === targetSupplyId);
+    if (!source || !target) return false;
+
+    const sourceItems = Array.isArray(source.items) ? source.items : [];
+    const targetItems = Array.isArray(target.items) ? [...target.items] : [];
+
+    // Pindahkan semua item source ke target
+    sourceItems.forEach((it) => {
+      targetItems.push({
+        ...it,
+        id: it.id || `item-${Date.now()}-${Math.floor(Math.random() * 10000)}`
+      });
+    });
+
+    const totalAmount = targetItems.reduce((sum, it) => sum + ((Number(it.buyPrice) || 0) * (Number(it.qty) || 1)), 0);
+    const itemsCount = targetItems.reduce((sum, it) => sum + (Number(it.qty) || 1), 0);
+
+    // Update target supply
+    const targetIdx = this.state.supplies.findIndex((s) => s.id === targetSupplyId);
+    this.state.supplies[targetIdx] = {
+      ...target,
+      items: targetItems,
+      totalAmount,
+      itemsCount
+    };
+
+    // Hapus source supply
+    this.state.supplies = this.state.supplies.filter((s) => s.id !== sourceSupplyId);
+
+    // Hapus transaksi kas keluar duplikat dari source supply jika ada
+    if (source.invoiceNo) {
+      this.state.transactions = (this.state.transactions || []).filter(
+        (t) => t.nota !== source.invoiceNo || t.category === 'BIAYA BELANJA SEPATU'
+      );
+    }
+
+    // Upsert produk katalog
+    targetItems.forEach((it) => {
+      if (it.barcode) {
+        this.upsertProduct({
+          barcode: it.barcode,
+          name: it.name,
+          kondisi: it.kondisi || 'Bagus',
+          catatanMinus: it.catatanMinus || '',
+          photo: it.photo || null,
+          buyPrice: it.buyPrice,
+          supplier: target.supplierName,
+          date: target.date,
+          qty: it.qty
+        });
+      }
+    });
+
+    this.notify();
+
+    setTimeout(async () => {
+      try {
+        const ts = new Date().toISOString();
+        this._lastPushTimestamp = ts;
+        await pushStateToSupabase(this.state, ts);
+        console.log('[Store] mergeSupplyInto pushed to Supabase immediately');
+      } catch (e) {
+        console.warn('[Store] Failed to push mergeSupplyInto to Supabase:', e.message);
+      }
+    }, 500);
+
+    return true;
+  }
+
+  // Master Catalog Products (Indexed by Barcode Code 39)
+  // Catatan: catalog produk hanya menyimpan metadata (nama, harga, foto, kondisi).
+  // Sumber stok HANYA dari supplies (faktur belanja), bukan dari field 'stock' di sini.
+  getProducts() {
+    if (!this.state.products || !Array.isArray(this.state.products)) {
+      this.state.products = [];
+    }
+    return this.state.products;
+  }
+
+  // =========================================================================
+  // LAPORAN REAL-TIME SISA STOCK (BARANG BELUM TERJUAL) & INVENTARIS
+  // =========================================================================
+
+  /**
+   * Menghasilkan Laporan Komprehensif Sisa Stock Belum Terjual Secara Real Time.
+   * 
+   * SUMBER STOK: HANYA dari Faktur Belanja / Supplies.
+   * Katalog Produk (products) HANYA dipakai sebagai metadata pelengkap
+   * (foto, harga jual) — TIDAK sebagai sumber kuantitas stok.
+   * 
+   * Formula: Sisa Stok = Total Qty Masuk (supplies) - Total Terjual (transaksi kasir)
+   * 
+   * Ketika faktur belanja dihapus → stoknya langsung hilang dari laporan ini.
+   * 
+   * @param {Object} options
+   * @param {string|null} options.excludeTrxId - Abaikan transaksi ID ini (misal saat edit)
+   * @returns {Object} { items, unsoldItems, summary }
+   */
+  getRealtimeStockReport(options = {}) {
+    const { excludeTrxId = null } = options;
+
+    // Gunakan cache bila tidak ada filter khusus (hemat CPU di dashboard & laporan)
+    if (!excludeTrxId && this._stockReportCache) {
+      return this._stockReportCache;
+    }
+    const transactions = this.getTransactions();
+    const supplies = this.getSupplies();
+    const products = this.getProducts(); // hanya untuk metadata pelengkap
+
+    // Buat indeks metadata dari katalog produk (foto, harga) — BUKAN kuantitas stok
+    const productMeta = new Map();
+    products.forEach((p) => {
+      if (!p.barcode) return;
+      const bc = p.barcode.toString().trim().toUpperCase();
+      productMeta.set(bc, p);
+    });
+
+    // 1. Kumpulkan jumlah fisik sepatu terjual per barcode & per nama
+    const soldCountByBarcode = new Map();
+    const soldCountByName = new Map();
+
+    transactions.forEach((t) => {
+      if (t.type !== 'masuk') return;
+      if (excludeTrxId && t.id === excludeTrxId) return;
+      // Abaikan transaksi non-penjualan sepatu
+      if (t.category === 'Dana Investor' || t.category === 'Investasi Modal' || t.category === 'Pelunasan Piutang') return;
+
+      if (t.items && Array.isArray(t.items) && t.items.length > 0) {
+        t.items.forEach((it) => {
+          if (it.barcode) {
+            const bc = it.barcode.toString().trim().toUpperCase();
+            soldCountByBarcode.set(bc, (soldCountByBarcode.get(bc) || 0) + 1);
+          }
+          const nm = (it.name || '').toString().trim().toLowerCase();
+          if (nm) {
+            soldCountByName.set(nm, (soldCountByName.get(nm) || 0) + 1);
+          }
+        });
+      } else {
+        if (t.barcode) {
+          const bc = t.barcode.toString().trim().toUpperCase();
+          const count = Number(t.itemCount) || 1;
+          soldCountByBarcode.set(bc, (soldCountByBarcode.get(bc) || 0) + count);
+        }
+        const nm = (t.productName || t.title || '').toString().trim().toLowerCase();
+        if (nm) {
+          const count = Number(t.itemCount) || 1;
+          soldCountByName.set(nm, (soldCountByName.get(nm) || 0) + count);
+        }
+      }
+    });
+
+    // 2. Kumpulkan stok HANYA dari Faktur Belanja (supplies)
+    //    Jika supply dihapus → tidak masuk ke stockMap → tidak muncul di laporan.
+    const stockMap = new Map();
+
+    supplies.forEach((sup) => {
+      if (!sup.items || !Array.isArray(sup.items)) return;
+      sup.items.forEach((it, idx) => {
+        const rawBc = it.barcode ? it.barcode.toString().trim().toUpperCase() : '';
+        const rawName = (it.name || 'Sepatu Tanpa Nama').trim();
+        // Kunci utama: barcode jika ada, fallback ke nama produk lowercase
+        const key = rawBc || `NAME:${rawName.toLowerCase()}`;
+        const qty = Math.max(0, Number(it.qty) || 0);
+        const buyPrice = Number(it.buyPrice) || 0;
+
+        // Ambil harga jual dari item supply; jika tidak ada coba dari catalog produk
+        const meta = rawBc ? productMeta.get(rawBc) : null;
+        const sellPrice = Number(it.sellPrice) ||
+          (meta ? Number(meta.sellPrice) : 0) ||
+          (buyPrice ? Math.round(buyPrice * 1.35) : 0);
+
+        if (!stockMap.has(key)) {
+          stockMap.set(key, {
+            key,
+            barcode: rawBc || it.barcode || `AUTO-${idx + 1}`,
+            hasRealBarcode: Boolean(rawBc),
+            name: rawName,
+            kondisi: it.kondisi || 'Bagus',
+            catatanMinus: it.catatanMinus || '',
+            buyPrice,
+            sellPrice,
+            photo: it.photo || (meta ? meta.photo : null) || null,
+            supplier: sup.supplierName || 'Suplier Umum',
+            lastSupplyDate: sup.date || '',
+            lastInvoiceNo: sup.invoiceNo || '',
+            totalMasuk: 0
+          });
+        }
+
+        const entry = stockMap.get(key);
+        entry.totalMasuk += qty;
+        // Perkaya metadata dari catalog produk jika ada
+        if (!entry.photo) {
+          entry.photo = it.photo || (meta ? meta.photo : null) || null;
+        }
+        if (it.kondisi === 'Minus') {
+          entry.kondisi = 'Minus';
+          if (it.catatanMinus) entry.catatanMinus = it.catatanMinus;
+        }
+        if (buyPrice > 0 && entry.buyPrice === 0) entry.buyPrice = buyPrice;
+        if (sellPrice > 0 && entry.sellPrice === 0) entry.sellPrice = sellPrice;
+        // Simpan tanggal supply terbaru
+        if (sup.date && (!entry.lastSupplyDate || sup.date > entry.lastSupplyDate)) {
+          entry.lastSupplyDate = sup.date;
+          entry.lastInvoiceNo = sup.invoiceNo || entry.lastInvoiceNo;
+        }
+      });
+    });
+
+    // 3. Kalkulasi per item: Terjual, Sisa, Nilai Modal Aset, Potensi Omset & Laba
+    const allItems = [];
+    let totalSisaPasang = 0;
+    let totalNilaiAsetModal = 0;
+    let totalPotensiOmset = 0;
+    let countKondisiBagus = 0;
+    let countKondisiMinus = 0;
+    let countStokMenipis = 0;
+    let totalTerjualSemua = 0;
+    let totalMasukSemua = 0;
+
+    stockMap.forEach((entry) => {
+      let sold = 0;
+      if (entry.hasRealBarcode) {
+        sold = soldCountByBarcode.get(entry.barcode.toString().trim().toUpperCase()) || 0;
+      } else {
+        sold = soldCountByName.get(entry.name.toLowerCase()) || 0;
+      }
+
+      totalMasukSemua += entry.totalMasuk;
+      totalTerjualSemua += sold;
+
+      const sisaStock = Math.max(0, entry.totalMasuk - sold);
+      const totalNilaiBeli = sisaStock * entry.buyPrice;
+      const totalNilaiJual = sisaStock * entry.sellPrice;
+      const potensiLaba = totalNilaiJual - totalNilaiBeli;
+      const marginPercent = entry.sellPrice > 0 ? Math.round(((entry.sellPrice - entry.buyPrice) / entry.sellPrice) * 100) : 0;
+
+      const itemReport = {
+        ...entry,
+        totalTerjual: sold,
+        sisaStock,
+        totalNilaiBeli,
+        totalNilaiJual,
+        potensiLaba,
+        marginPercent,
+        status: sisaStock === 0 ? 'habis' : (sisaStock <= 2 ? 'menipis' : 'ready')
+      };
+
+      allItems.push(itemReport);
+
+      if (sisaStock > 0) {
+        totalSisaPasang += sisaStock;
+        totalNilaiAsetModal += totalNilaiBeli;
+        totalPotensiOmset += totalNilaiJual;
+
+        if (entry.kondisi === 'Minus') {
+          countKondisiMinus += sisaStock;
+        } else {
+          countKondisiBagus += sisaStock;
+        }
+
+        if (sisaStock <= 2) {
+          countStokMenipis += 1;
+        }
+      }
+    });
+
+    // Urutkan: Stok aktif sisa terbanyak di atas
+    allItems.sort((a, b) => {
+      if (a.sisaStock > 0 && b.sisaStock === 0) return -1;
+      if (a.sisaStock === 0 && b.sisaStock > 0) return 1;
+      return b.sisaStock - a.sisaStock;
+    });
+
+    const unsoldItems = allItems.filter((it) => it.sisaStock > 0);
+    const totalPotensiLaba = totalPotensiOmset - totalNilaiAsetModal;
+    const avgMarginPercent = totalPotensiOmset > 0 ? Math.round((totalPotensiLaba / totalPotensiOmset) * 100) : 0;
+
+    const result = {
+      items: allItems,
+      unsoldItems,
+      summary: {
+        totalSisaPasang,
+        totalVarianSisa: unsoldItems.length,
+        totalVarianSemua: allItems.length,
+        totalMasukSemua,
+        totalTerjualSemua,
+        totalNilaiAsetModal,
+        totalPotensiOmset,
+        totalPotensiLaba,
+        avgMarginPercent,
+        countKondisiBagus,
+        countKondisiMinus,
+        countStokMenipis,
+        lastUpdated: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' WIB'
+      }
+    };
+
+    // Simpan ke cache bila tidak ada filter khusus
+    if (!excludeTrxId) {
+      this._stockReportCache = result;
+    }
+    return result;
+  }
+
+  // Available In-Stock Products (excluding already sold items)
+  // Menghasilkan daftar sepatu yang masih memiliki sisa stok > 0
+  getAvailableProducts(excludeTrxId = null) {
+    const report = this.getRealtimeStockReport({ excludeTrxId });
+    return report.unsoldItems.map((it) => ({
+      barcode: it.barcode,
+      name: it.name,
+      kondisi: it.kondisi || 'Bagus',
+      catatanMinus: it.catatanMinus || '',
+      sellPrice: it.sellPrice || (it.buyPrice ? Math.round(Number(it.buyPrice) * 1.35) : 0),
+      buyPrice: it.buyPrice || 0,
+      photo: it.photo || null,
+      supplier: it.supplier || '',
+      date: it.lastSupplyDate || '',
+      sisaStock: it.sisaStock,
+      totalMasuk: it.totalMasuk,
+      totalTerjual: it.totalTerjual
+    }));
+  }
+
+  isBarcodeSold(barcode, excludeTrxId = null) {
+    if (!barcode) return false;
+    const clean = barcode.toString().trim().toUpperCase();
+    const report = this.getRealtimeStockReport({ excludeTrxId });
+    const item = report.items.find((it) => it.barcode && it.barcode.toString().trim().toUpperCase() === clean);
+    if (!item) return false;
+    return item.sisaStock <= 0;
+  }
+
+  findSoldTransactionByBarcode(barcode, excludeTrxId = null) {
+    if (!barcode) return null;
+    const clean = barcode.toString().trim().toUpperCase();
+    const transactions = this.getTransactions();
+
+    for (const t of transactions) {
+      if (t.type !== 'masuk' || (excludeTrxId && t.id === excludeTrxId)) continue;
+
+      // Check primary barcode
+      if (t.barcode && t.barcode.toString().trim().toUpperCase() === clean) {
+        return t;
+      }
+
+      // Check items list in multi-shoe transaction
+      if (t.items && Array.isArray(t.items)) {
+        const found = t.items.find((it) => it.barcode && it.barcode.toString().trim().toUpperCase() === clean);
+        if (found) {
+          return t;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  getProductByBarcode(barcode) {
+    if (!barcode) return null;
+    const clean = barcode.toString().trim().toUpperCase();
+
+    // 1. Search in products catalog
+    const products = this.getProducts();
+    const found = products.find((p) => p.barcode && p.barcode.toString().trim().toUpperCase() === clean);
+    if (found) return found;
+
+    // 2. Search in supplies history
+    const supplies = this.getSupplies();
+    for (const sup of supplies) {
+      if (sup.items && Array.isArray(sup.items)) {
+        const item = sup.items.find((it) => it.barcode && it.barcode.toString().trim().toUpperCase() === clean);
+        if (item) {
+          return {
+            barcode: item.barcode,
+            name: item.name,
+            kondisi: item.kondisi || 'Bagus',
+            catatanMinus: item.catatanMinus || '',
+            photo: item.photo || null,
+            buyPrice: item.buyPrice || 0,
+            supplier: sup.supplierName,
+            date: sup.date
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  upsertProduct(product) {
+    if (!product || !product.barcode) return null;
+    const products = this.getProducts();
+    const clean = product.barcode.toString().trim().toUpperCase();
+    const idx = products.findIndex((p) => p.barcode && p.barcode.toString().trim().toUpperCase() === clean);
+
+    if (idx >= 0) {
+      products[idx] = { ...products[idx], ...product };
+    } else {
+      products.unshift(product);
+    }
+    this.saveState();
+    return product;
+  }
+
+  // Inventory / Stok
+  /**
+   * Daftar produk dengan stok menipis, dihitung dari DATA NYATA:
+   * item Barang Masuk yang belum terjual, dikelompokkan per nama produk.
+   * @param {number} threshold - sisa stok yang dianggap menipis (default 2)
+   */
+  getLowStockItems(threshold = 2) {
+    const available = this.getAvailableProducts();
+    const byName = new Map();
+
+    available.forEach((p) => {
+      const key = (p.name || 'Tanpa Nama').toString().trim();
+      if (!byName.has(key)) byName.set(key, { name: key, stock: 0 });
+      byName.get(key).stock += 1;
+    });
+
+    return Array.from(byName.values())
+      .filter((p) => p.stock <= threshold)
+      .sort((a, b) => a.stock - b.stock);
+  }
+
+  // Financial Calculations & Aggregates
+  getBalanceSummary() {
+    const trxs = this.getTransactions();
+    let totalMasuk = 0;
+    let totalKeluar = 0;
+    let countMasuk = 0;
+    let countKeluar = 0;
+
+    trxs.forEach((t) => {
+      const amt = Number(t.amount) || 0;
+      if (t.type === 'masuk') {
+        totalMasuk += amt;
+        countMasuk++;
+      } else {
+        totalKeluar += amt;
+        countKeluar++;
+      }
+    });
+
+    const initialTotal = (this.state.shop.initialBalanceLaci || 0) + (this.state.shop.initialBalanceBank || 0);
+    const currentBalance = initialTotal + totalMasuk - totalKeluar;
+
+    return {
+      currentBalance,
+      totalMasuk,
+      totalKeluar,
+      countMasuk,
+      countKeluar,
+      netProfit: totalMasuk - totalKeluar
+    };
+  }
+
+  // Shipments (Pengiriman Sepatu Terjual: Kemas, Kirim, Hold, Selesai)
+  getShipments(filterStatus = null) {
+    const allMasuk = (this.state.transactions || []).filter((t) => t.type === 'masuk');
+    const withStatus = allMasuk.map((t) => ({
+      ...t,
+      shippingStatus: t.shippingStatus || 'kemas'
+    }));
+
+    if (!filterStatus || filterStatus === 'all') {
+      return withStatus;
+    }
+    return withStatus.filter((t) => t.shippingStatus === filterStatus);
+  }
+
+  updateShipmentStatus(trxId, { status, courier, resi, note }) {
+    const idx = this.state.transactions.findIndex((t) => t.id === trxId);
+    if (idx !== -1) {
+      const cur = this.state.transactions[idx];
+      this.state.transactions[idx] = {
+        ...cur,
+        shippingStatus: status || cur.shippingStatus || 'kemas',
+        shippingCourier: courier !== undefined ? courier : cur.shippingCourier,
+        shippingResi: resi !== undefined ? resi : cur.shippingResi,
+        shippingNote: note !== undefined ? note : cur.shippingNote,
+        shippingUpdatedAt: new Date().toISOString()
+      };
+      this.notify();
+      return this.state.transactions[idx];
+    }
+    return null;
+  }
+
+  getShipmentSummary() {
+    const shipments = this.getShipments();
+    let countKemas = 0;
+    let countKirim = 0;
+    let countHold = 0;
+    let countSelesai = 0;
+
+    shipments.forEach((s) => {
+      const st = s.shippingStatus || 'kemas';
+      if (st === 'kemas') countKemas++;
+      else if (st === 'kirim') countKirim++;
+      else if (st === 'hold') countHold++;
+      else if (st === 'selesai') countSelesai++;
+    });
+
+    return {
+      total: shipments.length,
+      countKemas,
+      countKirim,
+      countHold,
+      countSelesai
+    };
+  }
+
+  /**
+   * Get sales statistics for the last N days
+   * Returns daily breakdown with date, revenue, shoe count, and transaction count
+   * Excludes investor transactions (only actual sales)
+   */
+  getSalesStatsByDays(days = 7, customRefDate = null) {
+    const trxs = this.getTransactions();
+    let refDate = new Date();
+
+    if (customRefDate) {
+      const parsed = new Date(customRefDate);
+      if (!isNaN(parsed.getTime())) refDate = parsed;
+    } else {
+      const todayStr = getLocalDateString(new Date());
+      const pastDays = new Date();
+      pastDays.setDate(pastDays.getDate() - (days - 1));
+      const pastDaysStr = getLocalDateString(pastDays);
+
+      const hasRecentData = trxs.some(t => t.date && t.date >= pastDaysStr && t.date <= todayStr);
+      if (!hasRecentData && trxs.length > 0) {
+        let maxDate = null;
+        trxs.forEach(t => {
+          if (t.date && t.type === 'masuk') {
+            const d = new Date(t.date);
+            if (!isNaN(d.getTime())) {
+              if (!maxDate || d > maxDate) maxDate = d;
+            }
+          }
+        });
+        if (maxDate) refDate = maxDate;
+      }
+    }
+
+    const stats = [];
+
+    // Create array of dates for last N days
+    for (let i = days - 1; i >= 0; i--) {
+      const date = new Date(refDate);
+      date.setDate(date.getDate() - i);
+      const dateStr = getLocalDateString(date);
+
+      // Filter sales transactions for this date (exclude investor & piutang)
+      const dayTrxs = trxs.filter(t => {
+        if (t.type !== 'masuk') return false;
+        if (!t.date) return false;
+        const cat = (t.category || '').toLowerCase();
+        if (cat.includes('investor') || cat.includes('piutang')) return false;
+        return t.date === dateStr;
+      });
+
+      // Calculate stats
+      let revenue = 0;
+      let shoeCount = 0;
+      dayTrxs.forEach(t => {
+        revenue += Number(t.amount) || 0;
+        // Count shoes from items array or itemCount
+        if (t.items && Array.isArray(t.items) && t.items.length > 0) {
+          shoeCount += t.items.reduce((sum, item) => sum + (Number(item.qty) || 1), 0);
+        } else if (t.itemCount && Number(t.itemCount) > 0) {
+          shoeCount += Number(t.itemCount);
+        } else {
+          const title = (t.title || '').toLowerCase();
+          const matchPasang = title.match(/(\d+)\s*(?:pasang|psg)/);
+          if (matchPasang) {
+            shoeCount += parseInt(matchPasang[1], 10);
+          } else {
+            shoeCount += 1;
+          }
+        }
+      });
+
+      stats.push({
+        date: dateStr,
+        dayName: date.toLocaleDateString('id-ID', { weekday: 'short' }), // Sen, Sel, Rab...
+        revenue,
+        shoeCount,
+        transactionCount: dayTrxs.length
+      });
+    }
+
+    // Calculate summary
+    const totalRevenue = stats.reduce((sum, d) => sum + d.revenue, 0);
+    const totalShoes = stats.reduce((sum, d) => sum + d.shoeCount, 0);
+    const totalTransactions = stats.reduce((sum, d) => sum + d.transactionCount, 0);
+    const avgRevenue = stats.length > 0 ? Math.round(totalRevenue / stats.length) : 0;
+    const avgShoes = stats.length > 0 ? totalShoes / stats.length : 0;
+
+    // Find best and worst day
+    const bestDay = stats.reduce((max, d) => d.revenue > max.revenue ? d : max, stats[0] || { revenue: 0, dayName: '-' });
+    const worstDay = stats.reduce((min, d) => d.revenue < min.revenue && d.revenue > 0 ? d : min, stats[0] || { revenue: 0, dayName: '-' });
+
+    return {
+      days: stats,
+      summary: {
+        totalRevenue,
+        totalShoes,
+        totalTransactions,
+        avgRevenue,
+        avgShoes,
+        bestDay,
+        worstDay
+      }
+    };
+  }
+
+  /**
+   * Laporan HPP (Harga Pokok Pembelian) Sepatu per Faktur Belanja
+   * Rumus: (Biaya Belanja Sepatu + Biaya Ongkir Belanja) / Total Pasang Sepatu
+   * @param {string} filterFaktur - 'all' atau nomor faktur spesifik (misal 'BALL-519')
+   */
+  getHppReports(filterFaktur = 'all') {
+    const supplies = Array.isArray(this.state.supplies) ? this.state.supplies : [];
+    const transactions = Array.isArray(this.state.transactions) ? this.state.transactions : [];
+
+    const reports = [];
+    const processedNotas = new Set();
+
+    supplies.forEach((s) => {
+      const invNo = (s.invoiceNo || s.id || '').trim();
+      const invUpper = invNo.toUpperCase();
+      if (invUpper) processedNotas.add(invUpper);
+
+      // Total pasang dari items atau itemsCount
+      let itemsCount = 0;
+      if (Array.isArray(s.items) && s.items.length > 0) {
+        itemsCount = s.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0);
+      } else {
+        itemsCount = Number(s.itemsCount) || 1;
+      }
+      if (itemsCount <= 0) itemsCount = 1;
+
+      const supplyTotal = Number(s.totalAmount) || 0;
+
+      // Cari transaksi belanja terkait faktur ini
+      const belanjaTrxs = transactions.filter((t) => {
+        if (t.type !== 'keluar') return false;
+        const cat = (t.category || '').toUpperCase();
+        const isBelanja = cat === 'BIAYA BELANJA SEPATU' || cat === 'BELANJA BARANG' || cat === 'BELANJA' || cat.includes('BELANJA');
+        const isOngkir = cat.includes('ONGKIR');
+        if (!isBelanja || isOngkir) return false;
+
+        const notaUpper = (t.nota || '').trim().toUpperCase();
+        const textUpper = ((t.title || '') + ' ' + (t.keterangan || '')).toUpperCase();
+        return (notaUpper && notaUpper === invUpper) || (invUpper && textUpper.includes(invUpper));
+      });
+
+      // Cari transaksi ongkir terkait faktur ini
+      const ongkirTrxs = transactions.filter((t) => {
+        if (t.type !== 'keluar') return false;
+        const cat = (t.category || '').toUpperCase();
+        const isOngkir = cat === 'BIAYA ONGKIR BELANJA' || cat.includes('ONGKIR');
+        if (!isOngkir) return false;
+
+        const notaUpper = (t.nota || '').trim().toUpperCase();
+        const textUpper = ((t.title || '') + ' ' + (t.keterangan || '')).toUpperCase();
+        return (notaUpper && notaUpper === invUpper) || (invUpper && textUpper.includes(invUpper));
+      });
+
+      // Nominal belanja: gunakan transaksi kas keluar riil jika ada, atau fallback ke supply.totalAmount
+      const sumBelanjaTrx = belanjaTrxs.reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      const totalBelanja = sumBelanjaTrx > 0 ? sumBelanjaTrx : supplyTotal;
+
+      // Nominal ongkir: jumlah transaksi kategori ongkir belanja
+      const totalOngkir = ongkirTrxs.reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+
+      const grandTotalCost = totalBelanja + totalOngkir;
+      const hppPerPcs = itemsCount > 0 ? Math.round(grandTotalCost / itemsCount) : 0;
+      const modalBeliPerPcs = itemsCount > 0 ? Math.round(totalBelanja / itemsCount) : 0;
+      const ongkirPerPcs = itemsCount > 0 ? Math.round(totalOngkir / itemsCount) : 0;
+
+      reports.push({
+        id: s.id,
+        invoiceNo: invNo,
+        supplierName: s.supplierName || 'Suplier Sepatu',
+        date: s.date || '',
+        status: s.status || 'lunas',
+        itemsCount,
+        totalBelanja,
+        totalOngkir,
+        grandTotalCost,
+        hppPerPcs,
+        modalBeliPerPcs,
+        ongkirPerPcs,
+        belanjaTrxsCount: belanjaTrxs.length,
+        ongkirTrxsCount: ongkirTrxs.length,
+        hasSupplyRecord: true
+      });
+    });
+
+    // Cari transaksi belanja / ongkir yang notanya belum masuk ke supplies (barang dalam perjalanan)
+    const orphanTrxs = transactions.filter((t) => {
+      if (t.type !== 'keluar') return false;
+      const cat = (t.category || '').toUpperCase();
+      const isBelanja = cat === 'BIAYA BELANJA SEPATU' || cat.includes('BELANJA');
+      const isOngkir = cat === 'BIAYA ONGKIR BELANJA' || cat.includes('ONGKIR');
+      if (!isBelanja && !isOngkir) return false;
+
+      const notaUpper = (t.nota || '').trim().toUpperCase();
+      return notaUpper && !processedNotas.has(notaUpper);
+    });
+
+    const orphanMap = new Map();
+    orphanTrxs.forEach((t) => {
+      const nota = (t.nota || '').trim();
+      const notaUpper = nota.toUpperCase();
+      if (!orphanMap.has(notaUpper)) {
+        orphanMap.set(notaUpper, {
+          invoiceNo: nota,
+          date: t.date || '',
+          belanja: 0,
+          ongkir: 0,
+          trxs: []
+        });
+      }
+      const item = orphanMap.get(notaUpper);
+      const cat = (t.category || '').toUpperCase();
+      if (cat.includes('ONGKIR')) {
+        item.ongkir += Number(t.amount) || 0;
+      } else {
+        item.belanja += Number(t.amount) || 0;
+      }
+      item.trxs.push(t);
+    });
+
+    orphanMap.forEach((val) => {
+      reports.push({
+        id: `PENDING-${val.invoiceNo}`,
+        invoiceNo: val.invoiceNo,
+        supplierName: 'Barang Dalam Perjalanan (Belum Input Stok)',
+        date: val.date,
+        status: 'pending-arrival',
+        itemsCount: 0,
+        totalBelanja: val.belanja,
+        totalOngkir: val.ongkir,
+        grandTotalCost: val.belanja + val.ongkir,
+        hppPerPcs: 0,
+        modalBeliPerPcs: 0,
+        ongkirPerPcs: 0,
+        belanjaTrxsCount: val.trxs.filter((t) => !(t.category || '').toUpperCase().includes('ONGKIR')).length,
+        ongkirTrxsCount: val.trxs.filter((t) => (t.category || '').toUpperCase().includes('ONGKIR')).length,
+        hasSupplyRecord: false
+      });
+    });
+
+    // Urutkan laporan terbaru di atas
+    reports.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+    // Filter jika faktur dipilih spesifik
+    let filteredReports = reports;
+    if (filterFaktur && filterFaktur !== 'all') {
+      const target = filterFaktur.trim().toUpperCase();
+      filteredReports = reports.filter((r) => (r.invoiceNo || '').trim().toUpperCase() === target);
+    }
+
+    // Hitung ringkasan akumulasi
+    const validReportsForCalc = filteredReports.filter((r) => r.itemsCount > 0);
+    const totalPasang = validReportsForCalc.reduce((sum, r) => sum + (r.itemsCount || 0), 0);
+    const totalBelanjaAll = filteredReports.reduce((sum, r) => sum + r.totalBelanja, 0);
+    const totalOngkirAll = filteredReports.reduce((sum, r) => sum + r.totalOngkir, 0);
+    const grandTotalAll = totalBelanjaAll + totalOngkirAll;
+    const avgHppPerPcs = totalPasang > 0 ? Math.round(grandTotalAll / totalPasang) : 0;
+    const avgModalBeliPerPcs = totalPasang > 0 ? Math.round(totalBelanjaAll / totalPasang) : 0;
+    const avgOngkirPerPcs = totalPasang > 0 ? Math.round(totalOngkirAll / totalPasang) : 0;
+
+    return {
+      reports: filteredReports,
+      allReports: reports,
+      summary: {
+        totalFaktur: filteredReports.length,
+        totalPasang,
+        totalBelanjaAll,
+        totalOngkirAll,
+        grandTotalAll,
+        avgHppPerPcs,
+        avgModalBeliPerPcs,
+        avgOngkirPerPcs
+      }
+    };
+  }
+
+  /**
+   * Mengambil daftar nomor faktur yang telah diinput pada 'BIAYA BELANJA SEPATU'
+   * Digunakan untuk breakdown pilihan faktur pada BIAYA ONGKIR BELANJA dan kolom BALL pada DATA BARANG MASUK.
+   * @returns {Array<{nota: string, date: string, amount: number, title: string, hasSupply: boolean}>}
+   */
+  getBelanjaSepatuFakturList() {
+    const transactions = Array.isArray(this.state.transactions) ? this.state.transactions : [];
+    const supplies = Array.isArray(this.state.supplies) ? this.state.supplies : [];
+
+    const supplyInvoiceSet = new Set(supplies.map((s) => (s.invoiceNo || '').trim().toUpperCase()));
+    const map = new Map();
+
+    // 1. Ambil dari transaksi kas keluar kategori BIAYA BELANJA SEPATU (dan variasinya)
+    transactions.forEach((t) => {
+      if (t.type !== 'keluar') return;
+      const cat = (t.category || '').toUpperCase();
+      const isBelanja = cat === 'BIAYA BELANJA SEPATU' || cat === 'BELANJA BARANG' || cat === 'BELANJA';
+      if (!isBelanja) return;
+
+      const nota = (t.nota || '').trim();
+      if (!nota) return;
+      const key = nota.toUpperCase();
+
+      if (!map.has(key)) {
+        map.set(key, {
+          nota: nota,
+          date: t.date || '',
+          amount: Number(t.amount) || 0,
+          title: t.title || t.keterangan || 'Biaya Belanja Sepatu',
+          hasSupply: supplyInvoiceSet.has(key)
+        });
+      } else {
+        const item = map.get(key);
+        item.amount += (Number(t.amount) || 0);
+        if (t.date && t.date > item.date) item.date = t.date;
+      }
+    });
+
+    // 2. Tambahkan juga nomor faktur dari supplies yang belum ada di map
+    supplies.forEach((s) => {
+      const inv = (s.invoiceNo || '').trim();
+      if (!inv) return;
+      const key = inv.toUpperCase();
+      if (!map.has(key)) {
+        map.set(key, {
+          nota: inv,
+          date: s.date || '',
+          amount: Number(s.totalAmount) || 0,
+          title: `Belanja ${s.supplierName || 'Suplier'} (${s.itemsCount || 1} psg)`,
+          hasSupply: true
+        });
+      }
+    });
+
+    return Array.from(map.values()).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  }
+
+  // Reset / Bersihkan Data
+  /**
+   * Hapus HANYA record contoh (dummy) bawaan aplikasi, berdasarkan ID/barcode persis.
+   * Data asli pengguna tidak disentuh. Mengembalikan jumlah yang dihapus.
+   */
+  purgeSampleData() {
+    const SAMPLE_TRX_IDS = ['TRX-101', 'TRX-102', 'TRX-103', 'TRX-104', 'TRX-105', 'TRX-106', 'TRX-107', 'TRX-108', 'TRX-109', 'TRX-110'];
+    const SAMPLE_SUPPLY_IDS = ['PASOK-01', 'PASOK-02', 'PASOK-03'];
+    const SAMPLE_INVESTOR_IDS = ['INV-1711000001', 'INV-1711000002'];
+    // Produk contoh hanya dihapus bila barcode DAN namanya sama persis (agar aman)
+    const SAMPLE_PRODUCTS = [
+      { barcode: 'SP-2024-0089', name: 'Compass Gazelle Low Retro Size 40-43' },
+      { barcode: 'VENTELA-41', name: 'Ventela Public Low Black Natural Size 41' },
+      { barcode: 'PIERO-JGR', name: 'Piero Jogger Premium Grey Size 42' },
+      { barcode: 'SLOP-KLT', name: 'Sandal Slop Kulit Pria Asli Sentosa Size 41' }
+    ];
+
+    const counts = {};
+    const filterOut = (list, isSample) => {
+      const before = (list || []).length;
+      const after = (list || []).filter((x) => !isSample(x));
+      counts.removed = (counts.removed || 0) + (before - after.length);
+      return after;
+    };
+
+    this.state.transactions = filterOut(this.state.transactions, (t) => SAMPLE_TRX_IDS.includes(t.id));
+    this.state.supplies = filterOut(this.state.supplies, (s) => SAMPLE_SUPPLY_IDS.includes(s.id));
+    this.state.investors = filterOut(this.state.investors, (i) => SAMPLE_INVESTOR_IDS.includes(i.id));
+    this.state.products = filterOut(this.state.products, (p) => {
+      const bc = (p.barcode || '').toString().trim().toUpperCase();
+      const nm = (p.name || '').toString().trim();
+      return SAMPLE_PRODUCTS.some((s) => s.barcode === bc && s.name === nm);
+    });
+
+    const removed = counts.removed || 0;
+    this.saveState();
+    this.notify();
+    return removed;
+  }
+
+  /** Kosongkan semua data transaksi & master (mulai baru), pengaturan toko tetap disimpan. */
+  resetToEmpty() {
+    const keptShop = this.state.shop ? JSON.parse(JSON.stringify(this.state.shop)) : JSON.parse(JSON.stringify(INITIAL_DATA.shop));
+    const keptSheets = this.state.googleSheets ? JSON.parse(JSON.stringify(this.state.googleSheets)) : null;
+
+    this.state = {
+      shop: keptShop,
+      transactions: [],
+      supplies: [],
+      products: [],
+      investors: []
+    };
+    if (keptSheets) this.state.googleSheets = keptSheets;
+
+    this.saveState();
+    this.notify();
+  }
+
+  exportData() {
+    return JSON.stringify(this.state, null, 2);
+  }
+
+  importData(jsonString) {
+    try {
+      const parsed = JSON.parse(jsonString);
+      if (parsed && parsed.shop && parsed.transactions) {
+        this.state = parsed;
+        this.saveState();
+        this.notify();
+        return true;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    return false;
+  }
+
+  // =====================
+  // Shipment / Pengiriman
+  // =====================
+
+  /** Ambil semua transaksi 'masuk' (penjualan) berdasarkan status pengiriman */
+  getShipments(status) {
+    const trxs = this.state.transactions || [];
+    return trxs.filter((t) => {
+      if (t.type !== 'masuk') return false;
+      if (t.category === 'Dana Investor' || t.category === 'Investasi Modal' || t.shippingStatus === null) return false;
+      const s = t.shippingStatus || 'kemas';
+      return status ? s === status : true;
+    });
+  }
+
+  /** Update status pengiriman + metadata (kurir, resi, catatan) */
+  updateShipmentStatus(id, { status, courier, resi, note } = {}) {
+    const idx = this.state.transactions.findIndex((t) => t.id === id);
+    if (idx === -1) return null;
+    const trx = this.state.transactions[idx];
+    this.state.transactions[idx] = {
+      ...trx,
+      shippingStatus: status !== undefined ? status : (trx.shippingStatus || 'kemas'),
+      shippingCourier: courier !== undefined ? courier : trx.shippingCourier,
+      shippingResi: resi !== undefined ? resi : trx.shippingResi,
+      shippingNote: note !== undefined ? note : trx.shippingNote
+    };
+    this.notify();
+    return this.state.transactions[idx];
+  }
+
+  /** Ringkasan jumlah paket per status */
+  getShipmentSummary() {
+    const trxs = this.getShipments();
+    return {
+      countKemas:   trxs.filter((t) => (t.shippingStatus || 'kemas') === 'kemas').length,
+      countKirim:   trxs.filter((t) => t.shippingStatus === 'kirim').length,
+      countHold:    trxs.filter((t) => t.shippingStatus === 'hold').length,
+      countSelesai: trxs.filter((t) => t.shippingStatus === 'selesai').length,
+      total:        trxs.length
+    };
+  }
+
+  // =====================
+  // Investor Management (Bagi Hasil 60:40 & Sesi Pembelanjaan >= 50%)
+  // =====================
+
+  getInvestors() {
+    return this.state.investors || [];
+  }
+
+  getInvestorById(id) {
+    return (this.state.investors || []).find((i) => i.id === id) || null;
+  }
+
+  addInvestor(data) {
+    if (!this.state.investors) this.state.investors = [];
+    const id = `INV-${Date.now()}`;
+    const totalAmount = Number(data.totalAmount) || 0;
+    const tenor = Number(data.tenor) || 1;
+    const cicilan = data.cicilan !== undefined ? Number(data.cicilan) : Math.round(totalAmount / tenor);
+
+    const newInvestor = {
+      id,
+      investorName: (data.investorName || '').trim(),
+      date: data.date || new Date().toISOString().split('T')[0],
+      dueDate: data.dueDate || null,
+      totalAmount,
+      tenor,
+      cicilan,
+      status: data.status || 'aktif',
+      notes: data.notes || '',
+      paymentMethod: data.paymentMethod || 'Transfer Bank',
+      sessionInvoices: Array.isArray(data.sessionInvoices) ? data.sessionInvoices : (data.sessionInvoices ? [data.sessionInvoices] : []),
+      payouts: [],
+      createdAt: new Date().toISOString()
+    };
+
+    // Aturan 2: Dana investor masuk otomatis menambah Saldo Kas Toko (Kas Masuk)
+    const trx = this.addTransaction({
+      type: 'masuk',
+      category: 'Dana Investor',
+      amount: totalAmount,
+      title: `Dana Investor: ${newInvestor.investorName}`,
+      paymentMethod: newInvestor.paymentMethod,
+      date: newInvestor.date,
+      nota: `#INV-${Math.floor(1000 + Math.random() * 9000)}`,
+      shippingStatus: null,
+      investorId: id,
+      sourceType: 'investor'
+    });
+    newInvestor.trxId = trx.id;
+
+    this.state.investors.unshift(newInvestor);
+    this.saveState();
+    this.notify();
+    return newInvestor;
+  }
+
+  updateInvestor(id, data) {
+    if (!this.state.investors) return null;
+    const idx = this.state.investors.findIndex((i) => i.id === id);
+    if (idx === -1) return null;
+
+    const old = this.state.investors[idx];
+    const investorName = data.investorName !== undefined ? data.investorName.trim() : old.investorName;
+    const totalAmount = data.totalAmount !== undefined ? Number(data.totalAmount) : old.totalAmount;
+    const tenor = data.tenor !== undefined ? Number(data.tenor) : old.tenor;
+    const cicilan = data.cicilan !== undefined ? Number(data.cicilan) : Math.round(totalAmount / (tenor || 1));
+    const sessionInvoices = data.sessionInvoices !== undefined
+      ? (Array.isArray(data.sessionInvoices) ? data.sessionInvoices : (data.sessionInvoices ? [data.sessionInvoices] : []))
+      : (old.sessionInvoices || []);
+
+    const updated = {
+      ...old,
+      ...data,
+      investorName,
+      totalAmount,
+      tenor,
+      cicilan,
+      sessionInvoices,
+      payouts: old.payouts || []
+    };
+
+    // Sinkronkan catatan kas masuk terkait
+    let linkedTrx = null;
+    if (old.trxId) {
+      linkedTrx = this.getTransactionById(old.trxId);
+    }
+    if (!linkedTrx && Array.isArray(this.state.transactions)) {
+      linkedTrx = this.state.transactions.find((t) => t.investorId === id && t.type === 'masuk');
+    }
+
+    if (linkedTrx) {
+      updated.trxId = linkedTrx.id;
+      this.updateTransaction(linkedTrx.id, {
+        amount: totalAmount,
+        title: `Dana Investor: ${updated.investorName}`,
+        date: updated.date || old.date,
+        paymentMethod: updated.paymentMethod || old.paymentMethod,
+        investorId: id,
+        sourceType: 'investor'
+      });
+    } else if (totalAmount > 0) {
+      const newTrx = this.addTransaction({
+        type: 'masuk',
+        category: 'Dana Investor',
+        amount: totalAmount,
+        title: `Dana Investor: ${updated.investorName}`,
+        paymentMethod: updated.paymentMethod || 'Transfer Bank',
+        date: updated.date || new Date().toISOString().split('T')[0],
+        nota: `#INV-${Math.floor(1000 + Math.random() * 9000)}`,
+        shippingStatus: null,
+        investorId: id,
+        sourceType: 'investor'
+      });
+      updated.trxId = newTrx.id;
+    }
+
+    this.state.investors[idx] = updated;
+    this.saveState();
+    this.notify();
+    return updated;
+  }
+
+  // Aturan 2: Saat membayar Bagi Hasil / Pokok, Saldo Kas Toko OTOMATIS BERKURANG (Kas Keluar)
+  addInvestorPayout(investorId, payoutData) {
+    if (!this.state.investors) return null;
+    const inv = this.state.investors.find((i) => i.id === investorId);
+    if (!inv) return null;
+
+    if (!Array.isArray(inv.payouts)) inv.payouts = [];
+
+    const amount = Number(payoutData.amount) || 0;
+    const type = payoutData.type || 'bagi_hasil'; // 'bagi_hasil' atau 'pokok'
+    const recipient = payoutData.recipient || 'investor'; // 'investor' atau 'pengelola'
+    const date = payoutData.date || new Date().toISOString().split('T')[0];
+    const paymentMethod = payoutData.paymentMethod || 'Transfer Bank';
+    const notes = (payoutData.notes || '').trim();
+
+    // Catat ke Buku Kas Toko sebagai Kas Keluar
+    let category = 'Bagi Hasil Investor';
+    let title = `Bagi Hasil (60%): ${inv.investorName}`;
+    let sourceType = 'investor_payout';
+
+    if (recipient === 'pengelola') {
+      category = 'Bagi Hasil Pengelola';
+      title = `Bagi Hasil (40%) Pengelola: ${inv.investorName}`;
+      sourceType = 'manager_payout';
+    } else if (type === 'pokok') {
+      category = 'Pengembalian Modal Investor';
+      title = `Pengembalian Modal: ${inv.investorName}`;
+      sourceType = 'investor_payout';
+    }
+
+    const trx = this.addTransaction({
+      type: 'keluar',
+      category,
+      amount,
+      title,
+      paymentMethod,
+      date,
+      nota: `#PAY-INV-${Math.floor(1000 + Math.random() * 9000)}`,
+      investorId,
+      sourceType,
+      notes
+    });
+
+    const payout = {
+      id: `PAY-${Date.now()}`,
+      amount,
+      type,
+      recipient,
+      date,
+      paymentMethod,
+      notes,
+      trxId: trx.id,
+      createdAt: new Date().toISOString()
+    };
+
+    inv.payouts.unshift(payout);
+    this.saveState();
+    this.notify();
+    return payout;
+  }
+
+  deleteInvestorPayout(investorId, payoutId) {
+    if (!this.state.investors) return false;
+    const inv = this.state.investors.find((i) => i.id === investorId);
+    if (!inv || !Array.isArray(inv.payouts)) return false;
+
+    const pIdx = inv.payouts.findIndex((p) => p.id === payoutId);
+    if (pIdx === -1) return false;
+
+    const payout = inv.payouts[pIdx];
+    // Hapus transaksi kas keluar terkait agar saldo kas kembali
+    if (payout.trxId && Array.isArray(this.state.transactions)) {
+      this.state.transactions = this.state.transactions.filter((t) => t.id !== payout.trxId);
+    }
+
+    inv.payouts.splice(pIdx, 1);
+    this.saveState();
+    this.notify();
+    return true;
+  }
+
+  deleteInvestor(id) {
+    if (!this.state.investors) return;
+    const inv = this.state.investors.find((i) => i.id === id);
+
+    if (inv) {
+      const invName = (inv.investorName || '').toLowerCase().trim();
+      const linkedTrxIds = new Set();
+      if (inv.trxId) linkedTrxIds.add(inv.trxId);
+      if (Array.isArray(inv.payouts)) {
+        inv.payouts.forEach((p) => {
+          if (p.trxId) linkedTrxIds.add(p.trxId);
+        });
+      }
+
+      if (Array.isArray(this.state.transactions)) {
+        this.state.transactions.forEach((t) => {
+          if (t.investorId === id) {
+            linkedTrxIds.add(t.id);
+          } else if (inv.trxId && t.id === inv.trxId) {
+            linkedTrxIds.add(t.id);
+          } else if (
+            (t.category === 'Dana Investor' || t.category === 'Bagi Hasil Investor' || t.category === 'Bagi Hasil Pengelola' || t.category === 'Pengembalian Modal Investor') &&
+            invName &&
+            t.title &&
+            t.title.toLowerCase().includes(invName)
+          ) {
+            linkedTrxIds.add(t.id);
+          }
+        });
+
+        if (linkedTrxIds.size > 0) {
+          this.state.transactions = this.state.transactions.filter((t) => !linkedTrxIds.has(t.id));
+        }
+      }
+    }
+
+    this.state.investors = this.state.investors.filter((i) => i.id !== id);
+    this.saveState();
+    this.notify();
+  }
+
+  // Hitung Analisis Sesi Pembelanjaan & Skema Bagi Hasil (60% Investor : 40% Pengelola setelah >= 50% terjual)
+  getInvestmentSessionReport(investorId = null) {
+    const investors = this.getInvestors();
+    const supplies = this.getSupplies();
+    const transactions = this.getTransactions();
+
+    // Kumpulkan penjualan aktual sepatu
+    const stockReport = this.getRealtimeStockReport ? this.getRealtimeStockReport() : { summary: {} };
+    const stockSummary = stockReport.summary || {};
+
+    const targetInvestors = investorId ? investors.filter((i) => i.id === investorId) : investors;
+
+    const reports = targetInvestors.map((inv) => {
+      const linkedInvoices = Array.isArray(inv.sessionInvoices) && inv.sessionInvoices.length > 0
+        ? inv.sessionInvoices
+        : [];
+
+      // Ambil faktur belanja terkait
+      const matchedSupplies = linkedInvoices.length > 0
+        ? supplies.filter((s) => linkedInvoices.includes(s.invoiceNo) || linkedInvoices.includes(s.id))
+        : supplies; // Default ke semua belanja jika belum ditautkan spesifik
+
+      // 1. Total Pasang Belanja Sesi & Total Modal Belanja (HPP Total)
+      let totalBeliPasang = 0;
+      let totalModalBelanja = 0;
+      const sessionBarcodes = new Set();
+      const sessionProductNames = new Set();
+
+      matchedSupplies.forEach((sup) => {
+        totalModalBelanja += Number(sup.totalAmount) || 0;
+        if (sup.items && Array.isArray(sup.items) && sup.items.length > 0) {
+          sup.items.forEach((it) => {
+            const q = Number(it.qty) || 1;
+            totalBeliPasang += q;
+            if (it.barcode) sessionBarcodes.add(it.barcode.toString().trim().toUpperCase());
+            if (it.name) sessionProductNames.add(it.name.toString().trim().toLowerCase());
+          });
+        } else {
+          totalBeliPasang += Number(sup.itemsCount) || 1;
+        }
+      });
+
+      // 2. Hitung Penjualan Aktual dari Sesi Ini
+      let totalTerjualPasang = 0;
+      let omzetPenjualan = 0;
+      let hppTerjual = 0;
+
+      transactions.forEach((t) => {
+        if (t.type !== 'masuk') return;
+        if (t.category === 'Dana Investor' || t.category === 'Investasi Modal' || t.category === 'Pelunasan Piutang') return;
+
+        // Cek apakah item transaksi cocok dengan produk dalam sesi belanja ini
+        if (t.items && Array.isArray(t.items) && t.items.length > 0) {
+          t.items.forEach((it) => {
+            const bc = it.barcode ? it.barcode.toString().trim().toUpperCase() : '';
+            const nm = (it.name || '').toString().trim().toLowerCase();
+            const isMatch = linkedInvoices.length === 0 ||
+              (bc && sessionBarcodes.has(bc)) ||
+              (nm && sessionProductNames.has(nm));
+
+            if (isMatch) {
+              totalTerjualPasang += 1;
+              const sellP = Number(it.price) || 0;
+              omzetPenjualan += sellP;
+              // Cari buyPrice dari supply atau fallback
+              let buyP = 0;
+              for (const sup of matchedSupplies) {
+                const found = (sup.items || []).find((si) => (si.barcode && si.barcode.toUpperCase() === bc) || (si.name && si.name.toLowerCase() === nm));
+                if (found && found.buyPrice) { buyP = Number(found.buyPrice); break; }
+              }
+              if (!buyP && sellP > 0) buyP = Math.round(sellP / 1.35);
+              hppTerjual += buyP;
+            }
+          });
+        } else {
+          const bc = t.barcode ? t.barcode.toString().trim().toUpperCase() : '';
+          const nm = (t.productName || t.title || '').toString().trim().toLowerCase();
+          const isMatch = linkedInvoices.length === 0 ||
+            (bc && sessionBarcodes.has(bc)) ||
+            (nm && sessionProductNames.has(nm));
+
+          if (isMatch) {
+            const count = Number(t.itemCount) || 1;
+            totalTerjualPasang += count;
+            const amt = Number(t.amount) || 0;
+            omzetPenjualan += amt;
+            let buyP = 0;
+            for (const sup of matchedSupplies) {
+              const found = (sup.items || []).find((si) => (si.barcode && si.barcode.toUpperCase() === bc) || (si.name && si.name.toLowerCase() === nm));
+              if (found && found.buyPrice) { buyP = Number(found.buyPrice); break; }
+            }
+            if (!buyP && amt > 0) buyP = Math.round(amt / 1.35);
+            hppTerjual += buyP;
+          }
+        }
+      });
+
+      // 3. Persentase Terjual & Status Aturan 50%
+      const persentaseTerjual = totalBeliPasang > 0
+        ? Math.min(100, Math.round((totalTerjualPasang / totalBeliPasang) * 100))
+        : 0;
+      const isEligible50 = persentaseTerjual >= 50;
+
+      // 4. Biaya Operasional & Biaya Lain Toko Sesi
+      // Mengambil total pengeluaran non-belanja & non-investor
+      let totalBiayaOperasionalToko = 0;
+      transactions.forEach((t) => {
+        if (t.type === 'keluar') {
+          const cat = (t.category || '').toLowerCase();
+          if (!cat.includes('belanja') && !cat.includes('investor') && !cat.includes('pengelola') && !cat.includes('pasok')) {
+            totalBiayaOperasionalToko += Number(t.amount) || 0;
+          }
+        }
+      });
+
+      // Proporsi biaya operasional yang dialokasikan ke sesi ini (berdasarkan rasio omzet sesi vs total omzet)
+      const totalOmzetToko = transactions.filter((t) => t.type === 'masuk' && t.category !== 'Dana Investor').reduce((s, t) => s + (Number(t.amount) || 0), 0) || 1;
+      const rasioSesi = Math.min(1, Math.max(0, omzetPenjualan / totalOmzetToko));
+      const biayaOpsSesi = Math.round(totalBiayaOperasionalToko * rasioSesi);
+
+      // 5. Keuntungan Bersih Sesi
+      // Laba Kotor = Omzet - HPP Terjual
+      const labaKotor = Math.max(0, omzetPenjualan - hppTerjual);
+      // Laba Bersih = Laba Kotor - Biaya Operasional Sesi
+      const labaBersih = Math.max(0, labaKotor - biayaOpsSesi);
+
+      // 6. Skema Bagi Hasil (60% Investor : 40% Pengelola HANYA jika terjual >= 50%)
+      const hakInvestor60 = isEligible50 ? Math.round(labaBersih * 0.60) : 0;
+      const hakPengelola40 = isEligible50 ? Math.round(labaBersih * 0.40) : 0;
+
+      // 7. Riwayat Payouts
+      const payouts = Array.isArray(inv.payouts) ? inv.payouts : [];
+      // Bagi Hasil Investor (60%)
+      const bagiHasilDibayar = payouts
+        .filter((p) => (p.recipient === 'investor' || !p.recipient) && p.type === 'bagi_hasil')
+        .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      const sisaBagiHasil = Math.max(0, hakInvestor60 - bagiHasilDibayar);
+
+      // Bagi Hasil Pengelola (40%)
+      const pengelolaDibayar = payouts
+        .filter((p) => p.recipient === 'pengelola' && p.type === 'bagi_hasil')
+        .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      const sisaHakPengelola = Math.max(0, hakPengelola40 - pengelolaDibayar);
+
+      // Pengembalian Pokok Modal
+      const pokokDikembalikan = payouts
+        .filter((p) => (p.recipient === 'investor' || !p.recipient) && p.type === 'pokok')
+        .reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      const sisaPokok = Math.max(0, (Number(inv.totalAmount) || 0) - pokokDikembalikan);
+
+      return {
+        investorId: inv.id,
+        investorName: inv.investorName,
+        date: inv.date,
+        totalModal: Number(inv.totalAmount) || 0,
+        status: inv.status || 'aktif',
+        notes: inv.notes || '',
+        sessionInvoices: linkedInvoices,
+        totalBeliPasang,
+        totalTerjualPasang,
+        sisaPasang: Math.max(0, totalBeliPasang - totalTerjualPasang),
+        persentaseTerjual,
+        isEligible50,
+        omzetPenjualan,
+        hppTerjual,
+        biayaOpsSesi,
+        labaKotor,
+        labaBersih,
+        hakInvestor60,
+        hakPengelola40,
+        bagiHasilDibayar,
+        sisaBagiHasil,
+        pengelolaDibayar,
+        sisaHakPengelola,
+        pokokDikembalikan,
+        sisaPokok,
+        payouts
+      };
+    });
+
+    return reports;
+  }
+
+  getInvestorSummary() {
+    const list = this.getInvestors();
+    const sessionReports = this.getInvestmentSessionReport();
+
+    const totalInvested = list.reduce((sum, i) => sum + (Number(i.totalAmount) || 0), 0);
+    const aktifList = list.filter((i) => (i.status || 'aktif') === 'aktif');
+    
+    let totalHakInvestor60 = 0;
+    let totalHakPengelola40 = 0;
+    let totalBagiHasilDibayar = 0;
+    let totalSisaBagiHasil = 0;
+    let totalPengelolaDibayar = 0;
+    let totalSisaHakPengelola = 0;
+    let totalPokokDikembalikan = 0;
+    let countEligible50 = 0;
+
+    sessionReports.forEach((r) => {
+      if (r.isEligible50) countEligible50 += 1;
+      totalHakInvestor60 += r.hakInvestor60;
+      totalHakPengelola40 += r.hakPengelola40;
+      totalBagiHasilDibayar += r.bagiHasilDibayar;
+      totalSisaBagiHasil += r.sisaBagiHasil;
+      totalPengelolaDibayar += r.pengelolaDibayar;
+      totalSisaHakPengelola += r.sisaHakPengelola;
+      totalPokokDikembalikan += r.pokokDikembalikan;
+    });
+
+    const totalPokokSisa = Math.max(0, totalInvested - totalPokokDikembalikan);
+
+    return {
+      totalInvested,
+      totalOutstanding: totalPokokSisa,
+      totalPokokSisa,
+      totalPokokDikembalikan,
+      totalHakInvestor60,
+      totalHakPengelola40,
+      totalBagiHasilDibayar,
+      totalSisaBagiHasil,
+      totalPengelolaDibayar,
+      totalSisaHakPengelola,
+      countEligible50,
+      countAktif: aktifList.length,
+      countTotal: list.length,
+      sessionReports
+    };
+  }
+
+  // Google Sheets integration configuration
+  getGoogleSheetsConfig() {
+    if (!this.state.googleSheets) {
+      this.state.googleSheets = {
+        spreadsheetId: '',
+        autoSync: false,
+        lastSync: null
+      };
+    }
+    return this.state.googleSheets;
+  }
+
+  saveGoogleSheetsConfig(config) {
+    this.state.googleSheets = {
+      ...(this.state.googleSheets || {}),
+      ...config
+    };
+    this.saveState();
+    this.notify();
+    return this.state.googleSheets;
+  }
+
+  setGoogleSheetsLastSync(timeStr) {
+    if (!this.state.googleSheets) {
+      this.state.googleSheets = { spreadsheetId: '', autoSync: false, lastSync: null };
+    }
+    this.state.googleSheets.lastSync = timeStr;
+    this.saveState();
+    // Do NOT call this.notify() here to prevent infinite auto-sync loop
+  }
+
+  // =====================
+  // Stock Opname Records
+  // =====================
+
+  /** Ambil semua riwayat opname, terbaru di atas. */
+  getOpnameRecords() {
+    if (!this.state.opnameRecords || !Array.isArray(this.state.opnameRecords)) {
+      this.state.opnameRecords = [];
+    }
+    return this.state.opnameRecords;
+  }
+
+  /** Simpan sesi opname baru. */
+  addOpnameRecord(record) {
+    if (!this.state.opnameRecords) this.state.opnameRecords = [];
+    const newRecord = {
+      id: `OPNAME-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      ...record
+    };
+    this.state.opnameRecords.unshift(newRecord);
+    this.saveState();
+    this.notify();
+    return newRecord;
+  }
+
+  /** Update riwayat opname (mis. status). */
+  updateOpnameRecord(id, data) {
+    if (!this.state.opnameRecords) return null;
+    const idx = this.state.opnameRecords.findIndex((r) => r.id === id);
+    if (idx === -1) return null;
+    this.state.opnameRecords[idx] = { ...this.state.opnameRecords[idx], ...data };
+    this.saveState();
+    this.notify();
+    return this.state.opnameRecords[idx];
+  }
+
+  /** Hapus riwayat opname. */
+  deleteOpnameRecord(id) {
+    if (!this.state.opnameRecords) return;
+    this.state.opnameRecords = this.state.opnameRecords.filter((r) => r.id !== id);
+    this.saveState();
+    this.notify();
+  }
+}
+
+
+
+export const store = new Store();
+
+// Currency formatter utility
+export function formatRupiah(number, prefix = 'Rp ') {
+  if (isNaN(number) || number === null || number === undefined) return `${prefix}0`;
+  const formatted = Math.round(number).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return `${prefix}${formatted}`;
+}
+
+export function parseRupiah(str) {
+  if (!str) return 0;
+  return Number(str.toString().replace(/[^0-9]/g, '')) || 0;
+}

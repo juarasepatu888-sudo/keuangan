@@ -1,0 +1,312 @@
+/**
+ * Konfigurasi scanner barcode yang dioptimalkan untuk HP.
+ *
+ * MASALAH YANG SERING MUNCUL pada barcode label kardus / tag produk:
+ * 1. Barcode 1D (Code 128 / Code 39) butuh area pindai PANJANG dan TEBAL,
+ *    bukan kotak kecil seperti QR Code.
+ * 2. Tag kardus gelap + stiker putih kecil menghasilkan kontras tidak
+ *    merata sehingga barcode sering gagal terkunci.
+ * 3. Kamera HP default sering fokus otomatis ke subjek terdekat (jari).
+ * 4. Resolusi preview bawaan html5-qrcode terlalu kecil untuk barcode
+ *    compact seperti pada foto tag sepatu.
+ *
+ * Solusi di bawah ini menangani keempat poin tersebut.
+ */
+import { Html5QrcodeSupportedFormats } from 'html5-qrcode';
+
+/**
+ * Cek dukungan kamera sebelum membuka scanner.
+ *
+ * PENTING: getUserMedia hanya boleh dipanggil pada "secure context",
+ * yaitu https:// atau http://localhost / 127.0.0.1.
+ * Jika aplikasi dibuka lewat IP LAN (mis. http://192.168.1.5:5173),
+ * browser akan MEMBLOKIR kamera secara otomatis.
+ *
+ * @returns {{ok: boolean, reason?: string, hint?: string}}
+ */
+export function checkCameraSupport() {
+  // 1. Butuh https atau localhost
+  const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
+  if (!window.isSecureContext && !isLocal) {
+    return {
+      ok: false,
+      reason: 'Konteks tidak aman (bukan HTTPS)',
+      hint: 'Kamera hanya boleh dibuka lewat alamat HTTPS atau http://localhost. ' +
+            'Saat ini Anda memakai http://' + window.location.host + '. ' +
+            'Coba: (1) adb reverse tcp:5173 tcp:5173 lalu buka http://localhost:5173 di HP, ' +
+            'atau (2) deploy aplikasi ke hosting HTTPS (GitHub Pages).'
+    };
+  }
+
+  // 2. Browser harus mendukung mediaDevices
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    return {
+      ok: false,
+      reason: 'Browser tidak mendukung akses kamera',
+      hint: 'Gunakan Chrome, Edge, atau browser Android terbaru yang mendukung WebRTC.'
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Terjemahkan error kamera menjadi pesan berbahasa Indonesia yang actionable.
+ */
+export function describeCameraError(err) {
+  const name = (err && err.name) || '';
+  const msg = (err && err.message) || String(err || '');
+
+  if (!window.isSecureContext && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
+    return 'Kamera diblokir karena alamat ini bukan HTTPS. ' +
+           'Gunakan http://localhost:5173 (adb reverse) atau deploy ke hosting HTTPS.';
+  }
+  if (name === 'NotAllowedError' || /permission/i.test(msg)) {
+    return 'Izin kamera ditolak. Buka pengaturan browser > Izin situs > Kamera, lalu izinkan.';
+  }
+  if (name === 'NotFoundError' || /no camera/i.test(msg)) {
+    return 'Tidak ada kamera yang tersedia di perangkat ini.';
+  }
+  if (name === 'NotReadableError' || /in use|being used/i.test(msg)) {
+    return 'Kamera sedang dipakai aplikasi lain. Tutup aplikasi kamera/WhatsApp lalu coba lagi.';
+  }
+  if (name === 'OverconstrainedError') {
+    return 'Kamera menolak resolusi yang diminta. Gadget kamera mungkin sedang dipakai aplikasi lain.';
+  }
+  if (name === 'SecurityError' || /secure context/i.test(msg)) {
+    return 'Kamera hanya bisa dibuka melalui HTTPS atau localhost.';
+  }
+
+  // Fallback: tampilkan pesan asli agar mudah didiagnosis
+  return 'Kamera gagal dibuka (' + (name || 'Error') + '): ' + msg;
+}
+
+/** Format yang didukung, diurutkan dari prioritas. */
+export const SUPPORTED_FORMATS = [
+  Html5QrcodeSupportedFormats.CODE_128, // Label retail pada tag sepatu
+  Html5QrcodeSupportedFormats.CODE_39,
+  Html5QrcodeSupportedFormats.CODE_93,
+  Html5QrcodeSupportedFormats.EAN_13,
+  Html5QrcodeSupportedFormats.EAN_8,
+  Html5QrcodeSupportedFormats.UPC_A,
+  Html5QrcodeSupportedFormats.UPC_E,
+  Html5QrcodeSupportedFormats.ITF,
+  Html5QrcodeSupportedFormats.CODABAR,
+  Html5QrcodeSupportedFormats.QR_CODE
+];
+
+/**
+ * Kotak pindai untuk barcode 1D.
+ *
+ * PENTING: qrbox TIDAK boleh lebih besar dari elemen container (#qr-reader),
+ * jika tidak html5-qrcode akan men-crop video dan area pindai berada di luar
+ * layar sehingga kamera tampak hitam.
+ *
+ * Area pindai dibuat lebar dan tipis (rasio sekitar 3:1) yang ideal untuk
+ * bar/bar pada stiker label kardus.
+ */
+export function getQrbox1D() {
+  return function(viewfinderWidth, viewfinderHeight) {
+    const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+    return {
+      width: Math.max(120, Math.min(460, Math.floor(viewfinderWidth * 0.88))),
+      height: Math.max(50, Math.min(160, Math.floor(minEdge * 0.45)))
+    };
+  };
+}
+
+/** Area pindai untuk QR Code / matrix (lebih tinggi, Opsional). */
+export function getQrbox2D() {
+  return function(viewfinderWidth, viewfinderHeight) {
+    const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
+    return {
+      width: Math.max(120, Math.min(300, Math.floor(minEdge * 0.75))),
+      height: Math.max(120, Math.min(300, Math.floor(minEdge * 0.75)))
+    };
+  };
+}
+
+/**
+ * Constraint kamera: memaksa browser memakai resolusi setinggi mungkin
+ * agar barcode kecil tetap terbaca, dengan autofocus & focus distance terbaik.
+ */
+export function buildCameraConstraints() {
+  return {
+    facingMode: { ideal: 'environment' },
+    width: { ideal: 1280, min: 640 },
+    height: { ideal: 720, min: 480 },
+    frameRate: { ideal: 30, min: 8 },
+    // Optimalkan autofocus & focus distance untuk barcode
+    focusMode: 'continuous',
+    focusDistance: 0.15
+  };
+}
+
+/** Konfigurasi utama scanner 1D. fps 30 supaya jauh lebih responsif. */
+export function buildScannerConfig1D() {
+  return {
+    fps: 30,
+    qrbox: getQrbox1D(),
+    disableFlip: false,
+    rememberLastUsedCamera: true,
+    formatsToSupport: SUPPORTED_FORMATS,
+    verbose: false,
+    useBarCodeDetectorIfSupported: true
+  };
+}
+
+/** Konfigurasi alternatif saat user ingin memindai barcode 2D. */
+export function buildScannerConfig2D() {
+  return {
+    fps: 30,
+    qrbox: getQrbox2D(),
+    disableFlip: false,
+    rememberLastUsedCamera: true,
+    formatsToSupport: SUPPORTED_FORMATS,
+    verbose: false
+  };
+}
+
+/**
+ * Peningkatan kontras pada layer preview kamera.
+ * ZXing (mesin di balik html5-qrcode) jauh lebih akurat saat kontras
+ * tipis pada label diperkuat dan noise dikurangi.
+ * Diterapkan lewat CSS filter pada elemen video.
+ */
+export const VIDEO_ENHANCE_STYLE = {
+  contrast: '1.15',
+  brightness: '1.02',
+  saturate: '1.1'
+};
+
+/**
+ * Debounce hasil scan: mencegah callback berulang dari frame yang sama
+ * atau pembacaan barcode parsial yang bergetar.
+ */
+export function createScanDebouncer(delayMs = 1500, minIntervalMs = 800) {
+  let lastText = '';
+  let lastTime = 0;
+  let isLocked = false;
+
+  const debouncer = function shouldAccept(text) {
+    if (isLocked) return false;
+    const now = Date.now();
+    // Cegah pembacaan bertubi-tubi dalam jeda singkat (termasuk pembacaan barcode parsial/flicker)
+    if (now - lastTime < minIntervalMs) return false;
+    // Debounce lebih ketat untuk barcode yang sama persis
+    if (text === lastText && now - lastTime < delayMs) return false;
+
+    lastText = text;
+    lastTime = now;
+    return true;
+  };
+
+  debouncer.lock = () => { isLocked = true; };
+  debouncer.unlock = () => { isLocked = false; };
+  debouncer.reset = () => {
+    lastText = '';
+    lastTime = 0;
+    isLocked = false;
+  };
+
+  return debouncer;
+}
+
+/**
+ * Memperjelas tampilan video kamera agar barcode lebih mudah dibaca.
+ *
+ * CATATAN: html5-qrcode v2.3.8 menyisipkan <video> LANGSUNG sebagai anak
+ * dari #qr-reader (tidak dibungkus video_wrapper), dan pada beberapa
+ * perangkat elemen itu baru muncul setelah start() selesai.
+ *
+ * Fungsi ini otomatis retry polling video sampai elemen ditemukan
+ * (maksimal 15 percobaan × 200ms = ~3 detik).
+ *
+ * @param {string} readerId - ID elemen container scanner
+ * @param {number} [_attempt=0] - Counter percobaan internal (jangan diisi manual)
+ */
+export function enhanceVideoElement(readerId, _attempt = 0) {
+  const reader = document.getElementById(readerId);
+  if (!reader) return;
+
+  // Cari <video> di dalam reader, atau cari langsung bila library beda struktur
+  let video = reader.querySelector('video');
+  if (!video) video = document.querySelector(`#${readerId} video`);
+
+  if (!video) {
+    // Video belum muncul: retry setelah 200ms (max 15 kali = ~3 detik)
+    if (_attempt < 15) {
+      setTimeout(() => enhanceVideoElement(readerId, _attempt + 1), 200);
+    }
+    return;
+  }
+
+  const { contrast, brightness, saturate } = VIDEO_ENHANCE_STYLE;
+  video.style.filter = `contrast(${contrast}) brightness(${brightness}) saturate(${saturate})`;
+  video.style.objectFit = 'cover';
+  video.style.width = '100%';
+  video.style.height = '100%';
+  video.style.display = 'block';
+
+  // Pastikan video benar-benar mulai displaying frame
+  if (video.paused) {
+    const p = video.play();
+    if (p && typeof p.catch === 'function') p.catch(() => { /* abaikan autoplay ditolak */ });
+  }
+}
+
+// Cooldown global untuk mencegah nada bip berbunyi berulang tanpa henti
+let _lastBeepTimestamp = 0;
+
+/**
+ * Mainkan suara "bip" pendek saat barcode berhasil terbaca.
+ * Menggunakan Web Audio API — tidak perlu file audio eksternal.
+ * Dilengkapi throttle cooldown (min 500ms) agar tidak memekakkan telinga.
+ *
+ * @param {'success'|'double'} type
+ *   'success' = satu bip singkat (default)
+ *   'double'  = dua bip cepat (untuk konfirmasi)
+ */
+export function playBeep(type = 'success') {
+  const nowMs = Date.now();
+  if (nowMs - _lastBeepTimestamp < 500) {
+    // Abaikan panggilan berulang dalam 500ms
+    return;
+  }
+  _lastBeepTimestamp = nowMs;
+
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    const beep = (startTime, freq = 1800, duration = 0.08, volume = 0.4) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, startTime);
+
+      gain.gain.setValueAtTime(0, startTime);
+      gain.gain.linearRampToValueAtTime(volume, startTime + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+
+      osc.start(startTime);
+      osc.stop(startTime + duration + 0.01);
+    };
+
+    const now = ctx.currentTime;
+    if (type === 'double') {
+      beep(now, 1800, 0.07);
+      beep(now + 0.12, 2200, 0.07);
+    } else {
+      beep(now, 1800, 0.1);
+    }
+
+    // Tutup AudioContext setelah selesai agar tidak bocor memory
+    setTimeout(() => { try { ctx.close(); } catch (_) { /* abaikan */ } }, 500);
+  } catch (_) {
+    // Browser tidak mendukung Web Audio API — abaikan diam-diam
+  }
+}

@@ -1,0 +1,243 @@
+import { renderPinLoginPage, initPinLoginPage } from './pages/pin-login.js';
+import { renderDashboardPage, initDashboardPage } from './pages/dashboard.js';
+import { renderTransaksiListPage, initTransaksiListPage } from './pages/transaksi-list.js';
+import { renderTambahTransaksiPage, initTambahTransaksiPage } from './pages/tambah-transaksi.js';
+import { renderBarangMasukListPage, initBarangMasukListPage } from './pages/barang-masuk-list.js';
+import { renderTambahBarangMasukPage, initTambahBarangMasukPage } from './pages/tambah-barang-masuk.js';
+import { renderPengirimanPage, initPengirimanPage } from './pages/pengiriman.js';
+import { renderInvestorPage, initInvestorPage } from './pages/investor.js';
+import { renderLaporanPage, initLaporanPage } from './pages/laporan.js';
+import { renderLaporanStockPage, initLaporanStockPage } from './pages/laporan-stock.js';
+import { renderPengaturanPage, initPengaturanPage } from './pages/pengaturan.js';
+import { renderStockOpnamePage, initStockOpnamePage } from './pages/stock-opname.js';
+import { renderTambahOpnamePage, initTambahOpnamePage } from './pages/tambah-opname.js';
+import { renderDetailOpnamePage, initDetailOpnamePage } from './pages/detail-opname.js';
+import { renderBottomNav, bindBottomNavEvents } from './components/bottom-nav.js';
+import { showToast } from './components/toast.js';
+
+
+export class Router {
+  constructor(store, appContainerId = 'app') {
+    this.store = store;
+    this.container = document.getElementById(appContainerId);
+    this.currentRoute = 'login';
+    this.params = {};
+
+    window.addEventListener('hashchange', () => {
+      this.handleHash();
+    });
+
+    // Otomatis re-render halaman aktif saat data store berubah (misal sinkronisasi Supabase masuk)
+    this.store.subscribe(() => {
+      if (this.currentRoute && this.currentRoute !== 'login') {
+        this.render();
+      }
+    });
+  }
+
+  init() {
+    if (!window.location.hash) {
+      window.location.hash = '#/login';
+    } else {
+      this.handleHash();
+    }
+  }
+
+  handleHash() {
+    const rawHash = window.location.hash.replace(/^#\/?/, '') || 'login';
+    const [path, queryString] = rawHash.split('?');
+    const params = {};
+    if (queryString) {
+      const searchParams = new URLSearchParams(queryString);
+      for (const [k, v] of searchParams.entries()) {
+        params[k] = v;
+      }
+    }
+
+    // Guard: jika belum login (tidak ada role di session) paksa ke login
+    if (path !== 'login' && !this.store.getRole()) {
+      window.location.hash = '#/login';
+      return;
+    }
+
+    this.navigate(path, params, false);
+  }
+
+  navigate(route, params = {}, updateHash = true) {
+    this.currentRoute = route;
+    this.params = params;
+
+    if (updateHash) {
+      const queryStr = Object.keys(params).length
+        ? '?' + new URLSearchParams(params).toString()
+        : '';
+      const newHash = `#/${route}${queryStr}`;
+      if (window.location.hash === newHash) {
+        // Hash sudah sama — hashchange TIDAK akan trigger — langsung render
+        this.render();
+      } else {
+        window.location.hash = newHash;
+        // render() akan dipanggil oleh hashchange listener
+      }
+      return;
+    }
+
+    this.render();
+  }
+
+  updateBottomNav() {
+    const navContainer = document.getElementById('global-bottom-nav');
+    if (!navContainer) return;
+
+    const navRoutes = {
+      'dashboard': 'dashboard',
+      'pasok': 'pasok',
+      'stock': 'pasok',
+      'barang-masuk': 'pasok',
+      'transaksi': 'transaksi',
+      'pengiriman': 'pengiriman',
+      'investor': 'investor',
+      'laporan': 'laporan',
+      'laporan-stock': 'laporan',
+      'pengaturan': 'pengaturan',
+      'stock-opname': 'pasok',
+      'tambah-opname': 'pasok',
+      'detail-opname': 'pasok',
+    };
+
+    const targetRoute = navRoutes[this.currentRoute];
+    if (targetRoute) {
+      navContainer.style.display = 'block';
+      navContainer.innerHTML = renderBottomNav(targetRoute, this.store.isAdmin());
+      bindBottomNavEvents(this);
+    } else {
+      navContainer.style.display = 'none';
+      navContainer.innerHTML = '';
+    }
+  }
+
+  render() {
+    if (!this.container) {
+      this.container = document.getElementById('app');
+    }
+    if (!this.container) return;
+
+    // Scroll container to top
+    this.container.scrollTop = 0;
+
+    // Update global frozen bottom navigation
+    this.updateBottomNav();
+
+    const isAdmin = this.store.isAdmin();
+
+    switch (this.currentRoute) {
+      case 'login':
+        this.container.innerHTML = renderPinLoginPage();
+        initPinLoginPage(this, this.store);
+        break;
+
+      case 'dashboard':
+        this.container.innerHTML = renderDashboardPage(this.store, isAdmin);
+        initDashboardPage(this, this.store, isAdmin);
+        break;
+
+      case 'transaksi':
+        this.container.innerHTML = renderTransaksiListPage(this.store, this.params.filter || 'all', isAdmin);
+        initTransaksiListPage(this, this.store, this.params.filter || 'all', isAdmin);
+        break;
+
+      case 'tambah-transaksi':
+        // Atasan tidak bisa input transaksi baru
+        if (!isAdmin) {
+          showToast('Akses Terbatas: Hanya Admin yang bisa menambah transaksi.', 'error');
+          this.navigate('transaksi');
+          return;
+        }
+        this.container.innerHTML = renderTambahTransaksiPage(this.store, this.params);
+        initTambahTransaksiPage(this, this.store, this.params);
+        break;
+
+      case 'pasok':
+      case 'stock':
+      case 'barang-masuk':
+        this.container.innerHTML = renderBarangMasukListPage(this.store, this.params.filter || 'all', isAdmin);
+        initBarangMasukListPage(this, this.store, this.params.filter || 'all', isAdmin);
+        break;
+
+      case 'tambah-pasok':
+      case 'tambah-stock':
+      case 'tambah-barang-masuk':
+        // Atasan tidak bisa menambah barang masuk
+        if (!isAdmin) {
+          showToast('Akses Terbatas: Hanya Admin yang bisa menambah barang.', 'error');
+          this.navigate('pasok');
+          return;
+        }
+        this.container.innerHTML = renderTambahBarangMasukPage(this.store, this.params);
+        initTambahBarangMasukPage(this, this.store, this.params);
+        break;
+
+      case 'pengiriman':
+        this.container.innerHTML = renderPengirimanPage(this.store, this.params.tab || 'kemas', isAdmin);
+        initPengirimanPage(this, this.store, this.params.tab || 'kemas', isAdmin);
+        break;
+
+      case 'investor':
+        this.container.innerHTML = renderInvestorPage(this.store, isAdmin);
+        initInvestorPage(this, this.store, isAdmin);
+        break;
+
+      case 'laporan':
+        this.container.innerHTML = renderLaporanPage(this.store, this.params.period || 'bulan', isAdmin);
+        initLaporanPage(this, this.store, this.params.period || 'bulan', isAdmin);
+        break;
+
+      case 'laporan-stock':
+        this.container.innerHTML = renderLaporanStockPage(this.store, isAdmin);
+        initLaporanStockPage(this, this.store, isAdmin);
+        break;
+
+      case 'pengaturan':
+        this.container.innerHTML = renderPengaturanPage(this.store, isAdmin);
+        initPengaturanPage(this, this.store, isAdmin);
+        break;
+
+      case 'stock-opname':
+        this.container.innerHTML = renderStockOpnamePage(this.store, isAdmin);
+        initStockOpnamePage(this, this.store, isAdmin);
+        break;
+
+      case 'tambah-opname':
+        if (!isAdmin) {
+          showToast('Akses Terbatas: Hanya Admin yang bisa melakukan Stock Opname.', 'error');
+          this.navigate('stock-opname');
+          return;
+        }
+        this.container.innerHTML = renderTambahOpnamePage(this.store);
+        initTambahOpnamePage(this, this.store);
+        break;
+
+      case 'detail-opname':
+        this.container.innerHTML = renderDetailOpnamePage(this.store, this.params, isAdmin);
+        initDetailOpnamePage(this, this.store, this.params, isAdmin);
+        break;
+
+      default:
+        this.container.innerHTML = renderDashboardPage(this.store, isAdmin);
+        initDashboardPage(this, this.store, isAdmin);
+        break;
+    }
+
+    // Bind any in-page [data-nav] elements (such as links or buttons in headers/cards)
+    this.container.querySelectorAll('[data-nav]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const target = btn.getAttribute('data-nav');
+        if (target) {
+          this.navigate(target);
+        }
+      });
+    });
+  }
+}
+
