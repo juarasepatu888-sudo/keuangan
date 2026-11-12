@@ -915,7 +915,7 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
             <span class="flex items-center gap-1 min-w-0">
               <span class="material-symbols-outlined text-[14px] text-primary">receipt_long</span>
               <span class="font-bold text-primary">Breakdown</span>
-              <span class="text-on-surface-variant truncate">• ${trx.items.length} Pasang • ${trx.paymentMethod || 'Tunai'}</span>
+              <span class="text-on-surface-variant truncate">• ${(trx.items || []).reduce((s, it) => s + (Number(it.qty) || 1), 0)} Pasang • ${trx.paymentMethod || 'Tunai'}</span>
             </span>
             <span class="flex items-center gap-1 shrink-0">
               <span class="text-on-surface-variant">Total:</span>
@@ -1605,13 +1605,14 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
       const trx = store.getTransactionById(addItemTargetTrxId);
       if (!trx) { showToast('Transaksi tidak ditemukan', 'error'); return; }
 
-      const newItem = { barcode: barcode || null, name: prod ? prod.name : null, kondisi: prod ? prod.kondisi : 'Bagus', price: price, photo: prod ? prod.photo : null };
-      const existingItems = trx.items && trx.items.length > 0 ? [...trx.items] : [{ barcode: trx.barcode || null, name: trx.productName || null, kondisi: trx.kondisi || 'Bagus', price: trx.amount || 0, photo: trx.photo || null }];
+      const newItem = { barcode: barcode || null, name: prod ? prod.name : null, kondisi: prod ? prod.kondisi : 'Bagus', price: price, qty: 1, photo: prod ? prod.photo : null };
+      const existingItems = trx.items && trx.items.length > 0 ? [...trx.items] : [{ barcode: trx.barcode || null, name: trx.productName || null, kondisi: trx.kondisi || 'Bagus', price: trx.amount || 0, qty: Number(trx.itemCount) || 1, photo: trx.photo || null }];
       const updatedItems = [...existingItems, newItem];
-      const newTotal = updatedItems.reduce((s, it) => s + (Number(it.price) || 0), 0);
-      const newTitle = trx.buyer ? (trx.buyer + ' • ' + updatedItems.length + ' pasang sepatu') : (updatedItems.length + ' pasang sepatu');
+      const newTotal = updatedItems.reduce((s, it) => s + ((Number(it.price) || 0) * (Number(it.qty) || 1)), 0);
+      const newTotalQty = updatedItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
+      const newTitle = trx.buyer ? (trx.buyer + ' • ' + newTotalQty + ' pasang sepatu') : (newTotalQty + ' pasang sepatu');
 
-      store.updateTransaction(addItemTargetTrxId, { items: updatedItems, amount: newTotal, itemCount: updatedItems.length, title: newTitle });
+      store.updateTransaction(addItemTargetTrxId, { items: updatedItems, amount: newTotal, itemCount: newTotalQty, title: newTitle });
       showToast('Barang berhasil ditambahkan! Total: +' + formatRupiah(newTotal, ''), 'success');
       closeAddItemModal();
       updateKpiDisplay();
