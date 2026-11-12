@@ -24,7 +24,7 @@ function createNewItem(defaultValues = {}) {
     kondisi: defaultValues.kondisi || 'Bagus',
     catatanMinus: defaultValues.catatanMinus || '',
     photo: defaultValues.photo || null,
-    qty: 1, // Fixed default 1 pcs
+    qty: Number(defaultValues.qty) || 1,
     buyPrice: Number(defaultValues.buyPrice) || 185000
   };
 }
@@ -201,13 +201,18 @@ function renderItemCardHtml(item, index, totalItems) {
         </div>
       </div>
 
-      <!-- 5. Qty (Locked 1 Pcs) & Harga Beli -->
+      <!-- 5. Qty (Stepper) & Harga Beli -->
       <div class="grid grid-cols-2 gap-2.5">
- <div class="flex flex-col justify-between glass-panel p-2.5 rounded-xl">
+        <div class="flex flex-col gap-1 glass-panel p-2.5 rounded-xl">
           <span class="font-label-sm text-[11px] text-on-surface font-semibold">Jumlah Pasang (Qty)</span>
-          <div class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg glass-chip-btn text-on-surface font-bold text-xs mt-1 select-none">
-            <span class="material-symbols-outlined text-[14px] text-on-surface-variant">lock</span>
-            <span class="font-tabular font-bold text-primary">1 Pcs</span>
+          <div class="flex items-center justify-between gap-1 mt-1">
+            <button type="button" class="btn-qty-minus w-8 h-8 rounded-lg glass-chip-btn text-on-surface font-bold text-lg flex items-center justify-center active:scale-95 select-none" data-item-id="${item.id}">−</button>
+            <input type="number" min="1" max="999"
+              class="input-qty w-12 text-center rounded-lg glass-input text-on-surface font-bold text-sm font-tabular focus:outline-none focus:ring-2 focus:ring-on-tertiary-container py-1"
+              value="${item.qty || 1}"
+              data-item-id="${item.id}"
+            />
+            <button type="button" class="btn-qty-plus w-8 h-8 rounded-lg glass-primary glass-btn text-primary-btn font-bold text-lg flex items-center justify-center active:scale-95 select-none" data-item-id="${item.id}">+</button>
           </div>
         </div>
 
@@ -1059,6 +1064,44 @@ export function initTambahBarangMasukPage(router, store, params = {}) {
         calculateTotals();
       });
     }
+
+    // Qty Stepper (+ / -) & Direct Input
+    const btnMinus = cardEl.querySelector('.btn-qty-minus');
+    const btnPlus = cardEl.querySelector('.btn-qty-plus');
+    const inputQty = cardEl.querySelector('.input-qty');
+
+    if (btnMinus) {
+      btnMinus.addEventListener('click', () => {
+        const current = Number(item.qty) || 1;
+        item.qty = Math.max(1, current - 1);
+        if (inputQty) inputQty.value = item.qty;
+        calculateTotals();
+      });
+    }
+
+    if (btnPlus) {
+      btnPlus.addEventListener('click', () => {
+        const current = Number(item.qty) || 1;
+        item.qty = Math.min(999, current + 1);
+        if (inputQty) inputQty.value = item.qty;
+        calculateTotals();
+      });
+    }
+
+    if (inputQty) {
+      inputQty.addEventListener('input', (e) => {
+        const val = parseInt(e.target.value, 10);
+        if (isNaN(val) || val < 1) {
+          item.qty = 1;
+        } else {
+          item.qty = Math.min(999, val);
+        }
+        calculateTotals();
+      });
+      inputQty.addEventListener('blur', (e) => {
+        inputQty.value = item.qty || 1;
+      });
+    }
   }
 
   function renderAllCards() {
@@ -1534,7 +1577,7 @@ export function initTambahBarangMasukPage(router, store, params = {}) {
           kondisi: itemToAdd.kondisi || 'Bagus',
           catatanMinus: itemToAdd.catatanMinus || '',
           photo: itemToAdd.photo || null,
-          qty: 1,
+          qty: Number(itemToAdd.qty) || 1,
           buyPrice: Number(itemToAdd.buyPrice) || 185000
         }, appendStatus);
       });
@@ -1557,7 +1600,7 @@ export function initTambahBarangMasukPage(router, store, params = {}) {
       kondisi: it.kondisi || 'Bagus',
       catatanMinus: it.catatanMinus || '',
       photo: it.photo || null,
-      qty: 1,
+      qty: Number(it.qty) || 1,
       buyPrice: Number(it.buyPrice) || 185000
     }));
 
