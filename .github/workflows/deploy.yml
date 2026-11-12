@@ -36,7 +36,9 @@ jobs:
 
       - name: Ensure configuration fallback
         run: |
-          if [ ! -f src/config/service-account.json ]; then
+          if [ -n "${{ secrets.SERVICE_ACCOUNT_JSON }}" ]; then
+            echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > src/config/service-account.json
+          elif [ ! -f src/config/service-account.json ]; then
             cp src/config/service-account.example.json src/config/service-account.json
           fi
 

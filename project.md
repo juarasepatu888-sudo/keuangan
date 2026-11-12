@@ -5,7 +5,7 @@ Aplikasi Buku Kas Digital khusus toko sepatu yang dirancang untuk penggunaan mob
 ## 🚀 Quick Links
 - **Repository**: [juarasepatu888-sudo/keuangan](https://github.com/juarasepatu888-sudo/keuangan)
 - **Supabase Console**: [carolcjpbogxwdvqruzg](https://supabase.com/dashboard/project/carolcjpbogxwdvqruzg)
-- **Production URL**: *Belum dikonfigurasi*
+- **Production URL**: [https://juarasepatu888-sudo.github.io/keuangan/](https://juarasepatu888-sudo.github.io/keuangan/)
 
 ---
 
