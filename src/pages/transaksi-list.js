@@ -1214,6 +1214,7 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
         if (productInfo) productInfo.classList.add('hidden');
         const modal = document.getElementById('add-item-modal');
         if (modal) modal.classList.remove('hidden');
+        populateModalStockDropdown('');
       });
     });
 
@@ -1370,8 +1371,35 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
     const popup = document.getElementById('modal-stock-dropdown-popup');
     if (!popup) return;
 
-    // Ambil daftar sepatu yang sisa stok fisiknya masih tersedia (> 0)
-    const available = store.getAvailableProducts();
+    // Hitung berapa pasang barcode yang sudah ada di dalam transaksi ini
+    const currentTrx = addItemTargetTrxId ? store.getTransactionById(addItemTargetTrxId) : null;
+    const usedInCurrentTrx = new Map();
+    if (currentTrx) {
+      if (currentTrx.items && Array.isArray(currentTrx.items)) {
+        currentTrx.items.forEach((it) => {
+          const bc = (it.barcode || '').toString().trim().toUpperCase();
+          if (bc) usedInCurrentTrx.set(bc, (usedInCurrentTrx.get(bc) || 0) + (Number(it.qty) || 1));
+          const nm = (it.name || '').toString().trim().toLowerCase();
+          if (nm) usedInCurrentTrx.set(`NAME:${nm}`, (usedInCurrentTrx.get(`NAME:${nm}`) || 0) + (Number(it.qty) || 1));
+        });
+      } else {
+        const bc = (currentTrx.barcode || '').toString().trim().toUpperCase();
+        if (bc) usedInCurrentTrx.set(bc, Number(currentTrx.itemCount) || 1);
+        const nm = (currentTrx.productName || currentTrx.title || '').toString().trim().toLowerCase();
+        if (nm) usedInCurrentTrx.set(`NAME:${nm}`, Number(currentTrx.itemCount) || 1);
+      }
+    }
+
+    // Ambil produk stok dengan mengecualikan transaksi ini (agar stok sebelum transaksi ini tetap terhitung)
+    const rawAvailable = store.getAvailableProducts(addItemTargetTrxId);
+
+    const available = rawAvailable.map((p) => {
+      const bc = (p.barcode || '').toString().trim().toUpperCase();
+      const nm = (p.name || '').toString().trim().toLowerCase();
+      const usedNow = (bc ? usedInCurrentTrx.get(bc) : null) || (nm ? usedInCurrentTrx.get(`NAME:${nm}`) : null) || 0;
+      const sisaTersedia = Math.max(0, (p.sisaStock || 0) - usedNow);
+      return { ...p, sisaTersedia };
+    }).filter((p) => p.sisaTersedia > 0);
 
     const query = (searchQuery || '').trim().toLowerCase();
     const filtered = query
@@ -1412,7 +1440,7 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
               <span class="font-bold text-xs text-on-surface truncate">${p.name || 'Sepatu Tanpa Nama'}</span>
               <div class="flex items-center gap-1 text-[9px] text-on-surface-variant">
                 <span class="font-mono font-bold glass-chip px-1 rounded text-primary">${p.barcode}</span>
-                <span class="text-[9px] text-primary font-semibold bg-primary/10 px-1 rounded">Sisa: ${p.sisaStock} psg</span>
+                <span class="text-[9px] text-primary font-semibold bg-primary/10 px-1 rounded">Sisa: ${p.sisaTersedia} psg</span>
                 ${p.kondisi === 'Minus' ? '<span class="text-amber-700 font-bold bg-amber-50 px-1 rounded border border-amber-200">Minus</span>' : '<span class="text-emerald-700 font-bold bg-emerald-50 px-1 rounded border border-emerald-200">Bagus</span>'}
               </div>
             </div>
@@ -1453,15 +1481,15 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
         router.navigate('tambah-transaksi', { editId: targetId, type: 'masuk', autoAddNewItem: true });
       }
     }
-    if (e.target && (e.target.id === 'btn-toggle-modal-stock' || e.target.closest('#btn-toggle-modal-stock'))) {
+    if (e.target && (e.target.id === 'add-item-barcode' || e.target.id === 'btn-toggle-modal-stock' || e.target.closest('#btn-toggle-modal-stock'))) {
       e.preventDefault();
       e.stopPropagation();
       const popup = document.getElementById('modal-stock-dropdown-popup');
       const bcInput = document.getElementById('add-item-barcode');
       if (popup) {
-        if (popup.classList.contains('hidden')) {
+        if (popup.classList.contains('hidden') || e.target.id === 'add-item-barcode') {
           populateModalStockDropdown(bcInput ? bcInput.value.trim() : '');
-          if (bcInput) bcInput.focus();
+          if (bcInput && e.target.id !== 'add-item-barcode') bcInput.focus();
         } else {
           popup.classList.add('hidden');
         }
@@ -1472,18 +1500,22 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
     }
   });
 
+  document.addEventListener('focusin', (e) => {
+    if (e.target && e.target.id === 'add-item-barcode') {
+      populateModalStockDropdown(e.target.value.trim());
+    }
+  });
+
   // Helper validasi barcode untuk modal tambah barang
   function checkModalBarcodeConflict(barcode, targetTrxId) {
     if (!barcode || !barcode.trim() || barcode.trim().length < 2) return null;
     const clean = barcode.trim().toUpperCase();
 
-    // Cek ketersediaan sisa stok fisik barang
-    const stockReport = store.getRealtimeStockReport();
+    // Cek ketersediaan sisa stok fisik barang dengan mengecualikan transaksi target
+    const stockReport = store.getRealtimeStockReport({ excludeTrxId: targetTrxId });
     const allReportItems = stockReport.items || [];
     const stockItem = allReportItems.find((item) => {
-      if (item.hasRealBarcode && item.barcode) {
-        return item.barcode.toString().trim().toUpperCase() === clean;
-      }
+      if (item.barcode && item.barcode.toString().trim().toUpperCase() === clean) return true;
       return false;
     });
 
@@ -1492,11 +1524,26 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
       if (!prod) {
         return `Barang dengan barcode "${clean}" tidak ditemukan di database stok.`;
       }
-    } else if (stockItem.sisaStock <= 0) {
-      const soldTrx = store.findSoldTransactionByBarcode(clean, targetTrxId);
-      const buyerInfo = soldTrx && soldTrx.buyer ? `ke ${soldTrx.buyer}` : '';
-      const notaInfo = soldTrx && soldTrx.nota ? `pada ${soldTrx.nota}` : 'di transaksi sebelumnya';
-      return `❌ Sepatu dengan barcode "${clean}" SUDAH HABIS TERJUAL ${notaInfo} ${buyerInfo}! (Sisa stok: 0).`;
+    } else {
+      // Hitung berapa pasang barcode ini yang sudah tercatat di transaksi target
+      const trx = targetTrxId ? store.getTransactionById(targetTrxId) : null;
+      let usedInTrx = 0;
+      if (trx) {
+        if (trx.items && Array.isArray(trx.items)) {
+          trx.items.forEach((it) => {
+            if (it.barcode && it.barcode.toString().trim().toUpperCase() === clean) {
+              usedInTrx += (Number(it.qty) || 1);
+            }
+          });
+        } else if (trx.barcode && trx.barcode.toString().trim().toUpperCase() === clean) {
+          usedInTrx += (Number(trx.itemCount) || 1);
+        }
+      }
+
+      const sisaTersedia = (stockItem.sisaStock || 0) - usedInTrx;
+      if (sisaTersedia <= 0) {
+        return `❌ Stok barcode "${clean}" sudah habis dialokasikan (Sisa stok: 0).`;
+      }
     }
 
     return null;
