@@ -2666,7 +2666,7 @@ class Store {
   getGoogleSheetsConfig() {
     if (!this.state.googleSheets) {
       this.state.googleSheets = {
-        spreadsheetId: '1iTev6j8z2GBzEGSz1Ui9fEMtYjEs30yQnOM8LfhI53Y',
+        spreadsheetId: '17Z74OlTkIuWo54yffiu3nYPdv5jCm-v4Nl_M9eWixJ0',
         autoSync: true,
         lastSync: null
       };
@@ -2686,7 +2686,7 @@ class Store {
 
   setGoogleSheetsLastSync(timeStr) {
     if (!this.state.googleSheets) {
-      this.state.googleSheets = { spreadsheetId: '1iTev6j8z2GBzEGSz1Ui9fEMtYjEs30yQnOM8LfhI53Y', autoSync: true, lastSync: null };
+      this.state.googleSheets = { spreadsheetId: '17Z74OlTkIuWo54yffiu3nYPdv5jCm-v4Nl_M9eWixJ0', autoSync: true, lastSync: null };
     }
     this.state.googleSheets.lastSync = timeStr;
     this.saveState();

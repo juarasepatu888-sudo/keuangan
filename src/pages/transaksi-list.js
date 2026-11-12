@@ -1371,35 +1371,15 @@ export function initTransaksiListPage(router, store, initialFilter = 'all', isAd
     const popup = document.getElementById('modal-stock-dropdown-popup');
     if (!popup) return;
 
-    // Hitung berapa pasang barcode yang sudah ada di dalam transaksi ini
-    const currentTrx = addItemTargetTrxId ? store.getTransactionById(addItemTargetTrxId) : null;
-    const usedInCurrentTrx = new Map();
-    if (currentTrx) {
-      if (currentTrx.items && Array.isArray(currentTrx.items)) {
-        currentTrx.items.forEach((it) => {
-          const bc = (it.barcode || '').toString().trim().toUpperCase();
-          if (bc) usedInCurrentTrx.set(bc, (usedInCurrentTrx.get(bc) || 0) + (Number(it.qty) || 1));
-          const nm = (it.name || '').toString().trim().toLowerCase();
-          if (nm) usedInCurrentTrx.set(`NAME:${nm}`, (usedInCurrentTrx.get(`NAME:${nm}`) || 0) + (Number(it.qty) || 1));
-        });
-      } else {
-        const bc = (currentTrx.barcode || '').toString().trim().toUpperCase();
-        if (bc) usedInCurrentTrx.set(bc, Number(currentTrx.itemCount) || 1);
-        const nm = (currentTrx.productName || currentTrx.title || '').toString().trim().toLowerCase();
-        if (nm) usedInCurrentTrx.set(`NAME:${nm}`, Number(currentTrx.itemCount) || 1);
-      }
-    }
-
-    // Ambil produk stok dengan mengecualikan transaksi ini (agar stok sebelum transaksi ini tetap terhitung)
+    // Ambil produk stok dengan mengecualikan transaksi ini.
+    // getAvailableProducts(excludeTrxId) sudah mengecualikan penjualan dari transaksi ini,
+    // sehingga sisaStock yang dikembalikan = stok yang benar-benar tersedia untuk ditambahkan.
     const rawAvailable = store.getAvailableProducts(addItemTargetTrxId);
 
-    const available = rawAvailable.map((p) => {
-      const bc = (p.barcode || '').toString().trim().toUpperCase();
-      const nm = (p.name || '').toString().trim().toLowerCase();
-      const usedNow = (bc ? usedInCurrentTrx.get(bc) : null) || (nm ? usedInCurrentTrx.get(`NAME:${nm}`) : null) || 0;
-      const sisaTersedia = Math.max(0, (p.sisaStock || 0) - usedNow);
-      return { ...p, sisaTersedia };
-    }).filter((p) => p.sisaTersedia > 0);
+    const available = rawAvailable.map((p) => ({
+      ...p,
+      sisaTersedia: p.sisaStock || 0
+    })).filter((p) => p.sisaTersedia > 0);
 
     const query = (searchQuery || '').trim().toLowerCase();
     const filtered = query
