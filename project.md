@@ -3,7 +3,7 @@
 Aplikasi Buku Kas Digital khusus toko sepatu yang dirancang untuk penggunaan mobile-first, offline-first, dan sinkronisasi real-time.
 
 ## 🚀 Quick Links
-- **Repository**: *Belum dikonfigurasi (menunggu repo baru)*
+- **Repository**: [juarasepatu888-sudo/keuangan](https://github.com/juarasepatu888-sudo/keuangan)
 - **Supabase Console**: *Belum dikonfigurasi (menunggu project baru)*
 - **Production URL**: *Belum dikonfigurasi*
 
