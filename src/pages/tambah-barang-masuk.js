@@ -211,8 +211,8 @@ function renderItemCardHtml(item, index, totalItems) {
           </label>
           <div class="flex items-center justify-between gap-1 mt-2 bg-black/25 p-1 rounded-lg border border-white/5 h-9">
             <button type="button" class="btn-qty-minus w-7 h-7 rounded-md glass-chip-btn text-on-surface font-bold text-base flex items-center justify-center active:scale-90 transition-all select-none" data-item-id="${item.id}" title="Kurangi 1">−</button>
-            <input type="number" min="1" max="999"
-              class="input-qty w-10 text-center bg-transparent text-on-surface font-bold text-sm font-tabular focus:outline-none"
+            <input type="number" min="1" max="999999"
+              class="input-qty flex-1 min-w-0 text-center bg-transparent text-on-surface font-bold text-sm font-tabular focus:outline-none"
               value="${item.qty || 1}"
               data-item-id="${item.id}"
             />
@@ -1091,7 +1091,7 @@ export function initTambahBarangMasukPage(router, store, params = {}) {
     if (btnPlus) {
       btnPlus.addEventListener('click', () => {
         const current = Number(item.qty) || 1;
-        item.qty = Math.min(999, current + 1);
+        item.qty = Math.min(999999, current + 1);
         if (inputQty) inputQty.value = item.qty;
         calculateTotals();
       });
@@ -1103,7 +1103,7 @@ export function initTambahBarangMasukPage(router, store, params = {}) {
         if (isNaN(val) || val < 1) {
           item.qty = 1;
         } else {
-          item.qty = Math.min(999, val);
+          item.qty = Math.min(999999, val);
         }
         calculateTotals();
       });

@@ -104,8 +104,8 @@ function renderSaleItemCard(item, index, totalItems) {
           </label>
           <div class="flex items-center justify-between gap-1 mt-1.5 bg-black/25 p-1 rounded-lg border border-white/5 h-8">
             <button type="button" class="btn-sale-qty-minus w-6 h-6 rounded-md glass-chip-btn text-on-surface font-bold text-sm flex items-center justify-center active:scale-90 transition-all select-none" data-sale-item-id="${item.id}" title="Kurangi 1">−</button>
-            <input type="number" min="1" max="999"
-              class="sale-item-qty w-10 text-center bg-transparent text-on-surface font-bold text-xs font-tabular focus:outline-none"
+            <input type="number" min="1" max="999999"
+              class="sale-item-qty flex-1 min-w-0 text-center bg-transparent text-on-surface font-bold text-xs font-tabular focus:outline-none"
               value="${itemQty}"
               data-sale-item-id="${item.id}"
             />
@@ -1126,7 +1126,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
           item = saleItems.find((it) => it.id === itemId);
         }
         if (item) {
-          item.qty = Math.min(999, (Number(item.qty) || 1) + 1);
+          item.qty = Math.min(999999, (Number(item.qty) || 1) + 1);
           const inputQty = document.querySelector(`.sale-item-qty[data-sale-item-id="${itemId}"]`);
           if (inputQty) inputQty.value = item.qty;
           recalcTotal();
@@ -1148,7 +1148,7 @@ export function initTambahTransaksiPage(router, store, params = {}) {
         }
         const val = parseInt(e.target.value, 10);
         if (item) {
-          item.qty = isNaN(val) || val < 1 ? 1 : Math.min(999, val);
+          item.qty = isNaN(val) || val < 1 ? 1 : Math.min(999999, val);
           recalcTotal();
         }
       });
